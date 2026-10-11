@@ -85,6 +85,7 @@ export default function CADashboard() {
   const [applyStep, setApplyStep] = useState(0); // 0: idle, 1: scanning, 2: matching, 3: filled, 4: submitted
   const [applyLog, setApplyLog] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  const [submittingTasks, setSubmittingTasks] = useState({}); // Per-task in-flight map: { [taskId]: true }
 
   // New Question form
   const [showAddModal, setShowAddModal] = useState(false);
@@ -172,15 +173,13 @@ export default function CADashboard() {
     const proof = resolveSupabaseStorageUrl(updatedApp.application_submitted_screenshot_url || updatedApp.screenshot_url);
     const targetId = updatedApp.id || updatedApp.distributionId;
     const targetTaskId = updatedApp.taskId || updatedApp.task_id;
-    const targetUrl = (updatedApp.job_url || '').split('?')[0].trim().toLowerCase();
 
     setClientJobs((prev) =>
       prev.map((j) => {
-        const jUrl = (j.job_url || '').split('?')[0].trim().toLowerCase();
+        const distId = j.id || j.distributionId;
         const isMatch = Boolean(
-          (targetId && (j.id === targetId || j.distributionId === targetId)) ||
           (targetTaskId && (j.taskId === targetTaskId || j.task_id === targetTaskId)) ||
-          (targetUrl && jUrl && jUrl === targetUrl)
+          (targetId && distId && distId === targetId)
         );
 
         if (isMatch) {
@@ -189,6 +188,7 @@ export default function CADashboard() {
             status: targetStatus,
             taskId: targetTaskId || j.taskId,
             task_id: targetTaskId || j.task_id,
+            worker_id: updatedApp.worker_id !== undefined ? updatedApp.worker_id : (j.worker_id || null),
             application_submitted_screenshot_url: proof || j.application_submitted_screenshot_url,
             applied_screenshot: proof || j.applied_screenshot,
             screenshot_url: proof || j.screenshot_url,
@@ -321,15 +321,13 @@ export default function CADashboard() {
         const freshTask = payload.new;
         if (!freshTask) return;
         const freshProof = resolveSupabaseStorageUrl(freshTask.application_submitted_screenshot_url || null);
-        const taskUrl = (freshTask.job_url || '').split('?')[0].trim().toLowerCase();
 
         setClientJobs((prevJobs) => {
           return prevJobs.map((j) => {
-            const jUrl = (j.job_url || '').split('?')[0].trim().toLowerCase();
+            const distId = j.id || j.distributionId;
             const isMatch = Boolean(
               (freshTask.id && (j.taskId === freshTask.id || j.task_id === freshTask.id)) ||
-              (freshTask.distribution_id && (j.id === freshTask.distribution_id || j.distributionId === freshTask.distribution_id)) ||
-              (taskUrl && jUrl && jUrl === taskUrl)
+              (freshTask.distribution_id && distId && distId === freshTask.distribution_id)
             );
 
             if (isMatch) {
@@ -338,7 +336,7 @@ export default function CADashboard() {
                 taskId: freshTask.id,
                 task_id: freshTask.id,
                 status: freshTask.status,
-                worker_id: freshTask.worker_id || j.worker_id,
+                worker_id: freshTask.worker_id || null,
                 application_submitted_screenshot_url: freshProof || j.application_submitted_screenshot_url,
                 applied_screenshot: freshProof || j.applied_screenshot,
                 screenshot_url: freshProof || j.screenshot_url,
@@ -513,6 +511,10 @@ export default function CADashboard() {
 
     // Optimistic UI: update ONLY this single application to 'queued' (by task id or distribution id ONLY)
     const targetJobId = job.id || job.distributionId;
+    const taskKey = String(targetTaskId || targetJobId);
+
+    // Store in-flight state per task ID ONLY (never as one shared boolean)
+    setSubmittingTasks((prev) => ({ ...prev, [taskKey]: true }));
 
     setClientJobs((prevJobs) =>
       prevJobs.map((j) => {
@@ -549,6 +551,12 @@ export default function CADashboard() {
           return isMatch ? { ...j, status: 'ready_for_review' } : j;
         })
       );
+    } finally {
+      setSubmittingTasks((prev) => {
+        const next = { ...prev };
+        delete next[taskKey];
+        return next;
+      });
     }
   };
 
@@ -556,6 +564,7 @@ export default function CADashboard() {
   useEffect(() => {
     if (!applywizzId) return;
     let isMounted = true;
+    const cleanId = String(applywizzId).trim().toUpperCase();
 
     const intervalId = setInterval(async () => {
       try {
@@ -563,17 +572,17 @@ export default function CADashboard() {
           supabase
             .from('job_distributions')
             .select('*')
-            .eq('applywizz_id', applywizzId)
+            .eq('applywizz_id', cleanId)
             .order('created_at', { ascending: false }),
           supabase
             .from('submission_tasks')
             .select('*')
-            .eq('applywizz_id', applywizzId)
+            .eq('applywizz_id', cleanId)
             .order('created_at', { ascending: false }),
           supabase
             .from('batch_job_queue')
             .select('*')
-            .eq('applywizz_id', applywizzId)
+            .eq('applywizz_id', cleanId)
             .order('created_at', { ascending: false })
             .limit(1),
         ]);
@@ -600,24 +609,27 @@ export default function CADashboard() {
               const distId = j.id || j.distributionId;
               const f = distId ? freshMap.get(distId) : null;
 
-              // A4: Find submission_tasks row by distribution_id ONLY (no URL or other fallback keys)
+              // D3: Match strictly by distribution_id from submission_tasks
               const st = distId ? subTasksByDist.get(distId) : null;
 
               // Row status comes from submission_tasks; use job_distributions status only when no task row exists
               const effectiveStatus = st
                 ? st.status
-                : ((f?.status === 'distributed' || f?.status === 'ready_to_review') ? 'ready_for_review' : (f?.status || j.status));
-              const effectiveWorker = st?.worker_id || f?.worker_id || j.worker_id;
+                : ((f?.status === 'distributed' || f?.status === 'ready_to_review') ? 'ready_for_review' : (f?.status || 'ready_for_review'));
+              const effectiveWorker = st?.worker_id || f?.worker_id || null;
 
+              // D4: Strictly that row's application_submitted_screenshot_url only
               const freshProof = resolveSupabaseStorageUrl(
-                st?.application_submitted_screenshot_url
-                || st?.screenshot_path
-                || f?.application_submitted_screenshot_url
-                || f?.applied_screenshot
-                || null
+                st?.application_submitted_screenshot_url || null
               );
 
-              if (effectiveStatus !== j.status || freshProof !== j.application_submitted_screenshot_url || (st && st.id !== j.taskId)) {
+              if (
+                effectiveStatus !== j.status ||
+                effectiveWorker !== j.worker_id ||
+                freshProof !== j.application_submitted_screenshot_url ||
+                (st && st.id !== j.taskId) ||
+                ((st?.error_message || null) !== (j.error_message || null))
+              ) {
                 changed = true;
                 return {
                   ...j,
@@ -628,6 +640,7 @@ export default function CADashboard() {
                   application_submitted_screenshot_url: freshProof,
                   applied_screenshot: freshProof,
                   screenshot_url: freshProof,
+                  error_message: st?.error_message || null,
                 };
               }
               return j;
@@ -1161,16 +1174,24 @@ export default function CADashboard() {
                 {clientJobs.length > 0 ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     {clientJobs.map((j, idx) => {
-                      const isSub = j.status === 'submitted' || j.status === 'completed';
-                      const isApplying = j.status === 'applying' || j.status === 'in_flight' || j.status === 'in_progress';
-                      const isQ = j.status === 'queued' || j.status === 'queued_for_submission' || j.status === 'in_queue' || j.status === 'approved_for_submission';
-                      const isFailed = j.status === 'failed' || j.status === 'error';
-                      const hasMissing = (j.unanswered_count && j.unanswered_count > 0) || j.status === 'needs_answers';
-                      const isReady = j.status === 'ready_for_review' || (!isSub && !isApplying && !isQ && !isFailed && !hasMissing);
+                      const isTaskInFlight = Boolean(
+                        (j.taskId && submittingTasks[j.taskId]) ||
+                        (j.task_id && submittingTasks[j.task_id]) ||
+                        (j.id && submittingTasks[j.id]) ||
+                        (j.distributionId && submittingTasks[j.distributionId])
+                      );
+                      const displayStatus = isTaskInFlight ? 'queued' : j.status;
+                      const isSub = displayStatus === 'submitted' || displayStatus === 'completed';
+                      const isApplying = displayStatus === 'applying' || displayStatus === 'in_flight' || displayStatus === 'in_progress';
+                      const isQ = displayStatus === 'queued' || displayStatus === 'queued_for_submission' || displayStatus === 'in_queue' || displayStatus === 'approved_for_submission';
+                      const isFailed = displayStatus === 'failed' || displayStatus === 'error';
+                      const hasMissing = (j.unanswered_count && j.unanswered_count > 0) || displayStatus === 'needs_answers';
+                      const isReady = displayStatus === 'ready_for_review' || (!isSub && !isApplying && !isQ && !isFailed && !hasMissing);
                       const isSelected = activeTask?.id === j.id;
-                      const cardScreenshot = isSub
-                        ? (j.application_submitted_screenshot_url || j.applied_screenshot || j.screenshot_url || null)
-                        : null;
+                      const isFinalSubmitted = displayStatus === 'submitted' || displayStatus === 'completed';
+                      const isFailedCard = displayStatus === 'failed' || displayStatus === 'error';
+                      // D4: Use application_submitted_screenshot_url of that row only
+                      const cardProofUrl = resolveSupabaseStorageUrl(j.application_submitted_screenshot_url || null);
 
                       let badgeBg = 'rgba(56, 189, 248, 0.15)';
                       let badgeColor = '#38bdf8';
@@ -1207,6 +1228,7 @@ export default function CADashboard() {
                       return (
                         <div
                           key={j.id || idx}
+                          className="application-job-card"
                           onClick={() => {
                             setActiveTask(j);
                             setJobUrl(j.job_url);
@@ -1246,8 +1268,8 @@ export default function CADashboard() {
                                 {badgeText}
                               </span>
 
-                              {/* Quick Review & Submit Button: ONLY when ready_for_review and fully answered */}
-                              {isReady && !hasMissing && (
+                              {/* Quick Review & Submit Button: ONLY when ready_for_review, NOT failed, and fully answered */}
+                              {isReady && !hasMissing && !isFailedCard && !isFinalSubmitted && !isApplying && !isQ && (
                                 <button
                                   type="button"
                                   onClick={(e) => handleCardQuickSubmit(e, j)}
@@ -1272,14 +1294,37 @@ export default function CADashboard() {
                                 </button>
                               )}
 
-                              {/* Authentic Confirmation Screenshot Button: Enabled ONLY after actual submission */}
-                              {cardScreenshot ? (
+                              {/* D5: If failed, show short error_message */}
+                              {isFailedCard && j.error_message && (
+                                <span
+                                  style={{
+                                    fontSize: '0.68rem',
+                                    color: '#f87171',
+                                    background: 'rgba(239, 68, 68, 0.1)',
+                                    padding: '2px 6px',
+                                    borderRadius: '4px',
+                                    border: '1px solid rgba(239, 68, 68, 0.25)',
+                                    maxWidth: '260px',
+                                    whiteSpace: 'nowrap',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                  }}
+                                  title={j.error_message}
+                                >
+                                  {j.error_message}
+                                </span>
+                              )}
+
+                              {/* D4: Submission screenshot button */}
+                              {isFinalSubmitted && (
                                 <button
                                   type="button"
+                                  disabled={!cardProofUrl}
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    if (!cardProofUrl) return;
                                     setDashboardScreenshot({
-                                      url: cardScreenshot,
+                                      url: cardProofUrl,
                                       company: j.company,
                                       role: j.role_title,
                                       status: 'submitted',
@@ -1290,43 +1335,55 @@ export default function CADashboard() {
                                     fontWeight: 700,
                                     padding: '2px 8px',
                                     borderRadius: '4px',
-                                    background: 'rgba(16, 185, 129, 0.18)',
-                                    color: '#34d399',
-                                    border: '1px solid rgba(16, 185, 129, 0.4)',
-                                    cursor: 'pointer',
+                                    background: cardProofUrl ? 'rgba(16, 185, 129, 0.18)' : 'rgba(51, 65, 85, 0.25)',
+                                    color: cardProofUrl ? '#34d399' : '#64748b',
+                                    border: cardProofUrl ? '1px solid rgba(16, 185, 129, 0.4)' : '1px solid #334155',
+                                    cursor: cardProofUrl ? 'pointer' : 'not-allowed',
                                     display: 'inline-flex',
                                     alignItems: 'center',
                                     gap: '4px',
-                                    transition: 'all 0.15s ease',
+                                    opacity: cardProofUrl ? 1 : 0.6,
                                   }}
-                                  title="View verified application proof screenshot"
+                                  title={cardProofUrl ? "View submission proof screenshot" : "No submission screenshot available"}
                                 >
                                   <Eye size={12} />
-                                  <span>View Screenshot</span>
+                                  <span>Submission screenshot</span>
                                 </button>
-                              ) : (
+                              )}
+
+                              {/* D4: Failure screenshot button */}
+                              {isFailedCard && (
                                 <button
                                   type="button"
-                                  disabled={true}
-                                  onClick={(e) => e.stopPropagation()}
+                                  disabled={!cardProofUrl}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (!cardProofUrl) return;
+                                    setDashboardScreenshot({
+                                      url: cardProofUrl,
+                                      company: j.company,
+                                      role: j.role_title,
+                                      status: 'failed',
+                                    });
+                                  }}
                                   style={{
                                     fontSize: '0.68rem',
                                     fontWeight: 700,
                                     padding: '2px 8px',
                                     borderRadius: '4px',
-                                    background: 'rgba(51, 65, 85, 0.25)',
-                                    color: '#64748b',
-                                    border: '1px solid #334155',
-                                    cursor: 'not-allowed',
+                                    background: cardProofUrl ? 'rgba(239, 68, 68, 0.18)' : 'rgba(51, 65, 85, 0.25)',
+                                    color: cardProofUrl ? '#f87171' : '#64748b',
+                                    border: cardProofUrl ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid #334155',
+                                    cursor: cardProofUrl ? 'pointer' : 'not-allowed',
                                     display: 'inline-flex',
                                     alignItems: 'center',
                                     gap: '4px',
-                                    opacity: 0.7,
+                                    opacity: cardProofUrl ? 1 : 0.6,
                                   }}
-                                  title="Real submission screenshot will appear here once application is successfully submitted on Workday"
+                                  title={cardProofUrl ? "View failure screenshot" : "No failure screenshot available"}
                                 >
-                                  <Clock size={12} />
-                                  <span>Screenshot (Pending)</span>
+                                  <Eye size={12} />
+                                  <span>Failure screenshot</span>
                                 </button>
                               )}
                             </div>

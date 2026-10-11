@@ -65,6 +65,13 @@ export default function ApplicationSlideDrawer({
   const distributionId = application?.distributionId || application?.id || null;
   const currentStatus = application?.status || 'ready_for_review';
 
+  // D2: Reset taskRow and appDetails whenever opened application changes
+  useEffect(() => {
+    setAppDetails(null);
+    setActionMessage('');
+    setSubmitting(false);
+  }, [distributionId, isOpen]);
+
   useEffect(() => {
     if (!isOpen || !applywizzId || (!jobUrl && !distributionId)) return;
 
@@ -82,14 +89,16 @@ export default function ApplicationSlideDrawer({
         if (!isMounted) return;
 
         if (res.success) {
-          setAppDetails(res.application);
-          setFields(res.fields || []);
-          // Initialize edit values
-          const initialEdits = {};
-          for (const f of res.fields || []) {
-            initialEdits[f.id] = f.value || '';
+          // Only apply if still on this distribution
+          if (res.application?.distributionId === distributionId || !distributionId) {
+            setAppDetails(res.application);
+            setFields(res.fields || []);
+            const initialEdits = {};
+            for (const f of res.fields || []) {
+              initialEdits[f.id] = f.value || '';
+            }
+            setEditValues(initialEdits);
           }
-          setEditValues(initialEdits);
         } else {
           // Fallback to application object properties if direct fetch returned empty
           const fallbackFields = [];
@@ -127,13 +136,15 @@ export default function ApplicationSlideDrawer({
 
           setFields(fallbackFields);
           setAppDetails({
-            id: application.id,
+            id: distributionId || application.id,
+            distributionId,
             applywizzId,
             company: application.company || 'Workday Employer',
             roleTitle: application.role_title || application.job_title || 'Workday Application',
             jobUrl,
             status: currentStatus,
-            screenshotUrl: application.screenshot_url || application.proof_screenshot_url || application.applied_screenshot || null,
+            screenshotUrl: application.application_submitted_screenshot_url || null,
+            application_submitted_screenshot_url: application.application_submitted_screenshot_url || null,
           });
         }
       } catch (err) {
@@ -145,76 +156,88 @@ export default function ApplicationSlideDrawer({
 
     loadFormDetails();
     return () => { isMounted = false; };
-  }, [isOpen, applywizzId, jobUrl, distributionId, currentStatus]);
+  }, [isOpen, applywizzId, jobUrl, distributionId]);
 
-  // Live polling & Realtime for this specific application task in submission_tasks
+  // Live polling & Realtime: strictly bound to this application's distribution_id ONLY
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !distributionId) return;
 
     let isMounted = true;
-    const targetTaskId = appDetails?.taskId || appDetails?.task_id || application?.taskId || application?.task_id || null;
+    const currentDistId = distributionId;
 
     const interval = setInterval(async () => {
       try {
-        let taskRow = null;
-        if (targetTaskId) {
-          const { data: tData } = await supabase.from('submission_tasks').select('*').eq('id', targetTaskId).maybeSingle();
-          if (tData) taskRow = tData;
-        } else if (distributionId) {
-          const { data: tData } = await supabase.from('submission_tasks').select('*').eq('distribution_id', distributionId).maybeSingle();
-          if (tData) taskRow = tData;
-        }
-
-        let updated = null;
-        if (distributionId) {
-          const { data } = await supabase.from('job_distributions').select('*').eq('id', distributionId).limit(1);
-          if (data && data.length > 0) updated = data[0];
-        }
+        // D2: Drawer status must come ONLY from submission_tasks where distribution_id equals opened application
+        const { data: taskRow } = await supabase
+          .from('submission_tasks')
+          .select('*')
+          .eq('distribution_id', currentDistId)
+          .maybeSingle();
 
         if (!isMounted) return;
 
-        const effectiveTaskId = taskRow?.id || targetTaskId || null;
-        const effectiveWorkerId = taskRow?.worker_id || updated?.worker_id || null;
-        const latestStatus = taskRow?.status || updated?.status || null;
-        const isLatestSubmitted = latestStatus === 'submitted' || latestStatus === 'completed';
+        let updated = null;
+        const { data: distData } = await supabase
+          .from('job_distributions')
+          .select('*')
+          .eq('id', currentDistId)
+          .limit(1);
+        if (distData && distData.length > 0) updated = distData[0];
 
-        const rawProof = isLatestSubmitted
+        if (!isMounted) return;
+
+        // Ignore poll results if distribution ID mismatch
+        if (taskRow && taskRow.distribution_id !== currentDistId) return;
+
+        const effectiveTaskId = taskRow?.id || null;
+        const effectiveWorkerId = taskRow?.worker_id || null;
+        const latestStatus = taskRow?.status || updated?.status || currentStatus || 'ready_for_review';
+        const isLatestSubmitted = latestStatus === 'submitted' || latestStatus === 'completed';
+        const isLatestFailed = latestStatus === 'failed' || latestStatus === 'error';
+
+        // D4: Use application_submitted_screenshot_url of that row ONLY
+        const rawProof = (isLatestSubmitted || isLatestFailed)
           ? (taskRow?.application_submitted_screenshot_url || updated?.application_submitted_screenshot_url || null)
           : null;
-
         const resolvedProof = resolveSupabaseStorageUrl(rawProof);
 
-        if (resolvedProof || latestStatus || effectiveWorkerId || effectiveTaskId) {
-          setAppDetails((prev) => ({
+        setAppDetails((prev) => {
+          if (prev && prev.distributionId && prev.distributionId !== currentDistId) return prev;
+          return {
             ...prev,
-            taskId: effectiveTaskId || prev?.taskId,
-            task_id: effectiveTaskId || prev?.task_id,
-            status: latestStatus || prev?.status,
-            worker_id: effectiveWorkerId || prev?.worker_id,
-            screenshotUrl: resolvedProof || prev?.screenshotUrl,
-            application_submitted_screenshot_url: resolvedProof || prev?.application_submitted_screenshot_url,
-          }));
+            id: currentDistId,
+            distributionId: currentDistId,
+            taskId: effectiveTaskId,
+            task_id: effectiveTaskId,
+            status: latestStatus,
+            worker_id: effectiveWorkerId,
+            screenshotUrl: resolvedProof,
+            application_submitted_screenshot_url: resolvedProof,
+            error_message: taskRow?.error_message || null,
+          };
+        });
 
-          if (latestStatus === 'queued') {
-            setActionMessage('⏳ Queued: Waiting for next available submitting worker...');
-          } else if (latestStatus === 'applying' && effectiveWorkerId) {
-            setActionMessage(`⚡ Applying on Workday via ${effectiveWorkerId.replace('_', ' ')}...`);
-          }
-
-          if (isLatestSubmitted && resolvedProof) {
-            setSubmitting(false);
-            setActionMessage('✓ Application successfully submitted on Workday! Mandatory screenshot proof saved.');
-            if (onStatusUpdated) {
-              onStatusUpdated({
-                ...application,
-                taskId: effectiveTaskId,
-                task_id: effectiveTaskId,
-                status: latestStatus || 'submitted',
-                worker_id: effectiveWorkerId,
-                application_submitted_screenshot_url: resolvedProof,
-                screenshot_url: resolvedProof,
-              });
-            }
+        if (latestStatus === 'queued') {
+          setActionMessage('⏳ Queued: Waiting for next available submitting worker...');
+        } else if (latestStatus === 'applying' && effectiveWorkerId) {
+          setActionMessage(`⚡ Applying on Workday via ${effectiveWorkerId.replace('_', ' ')}...`);
+        } else if (latestStatus === 'failed') {
+          setActionMessage(`⚠️ Application failed: ${taskRow?.error_message || 'Submission error'}`);
+        } else if (isLatestSubmitted && resolvedProof) {
+          setSubmitting(false);
+          setActionMessage('✓ Application successfully submitted on Workday! Mandatory screenshot proof saved.');
+          if (onStatusUpdated) {
+            onStatusUpdated({
+              ...application,
+              id: currentDistId,
+              distributionId: currentDistId,
+              taskId: effectiveTaskId,
+              task_id: effectiveTaskId,
+              status: latestStatus,
+              worker_id: effectiveWorkerId,
+              application_submitted_screenshot_url: resolvedProof,
+              screenshot_url: resolvedProof,
+            });
           }
         }
       } catch (e) {
@@ -222,53 +245,64 @@ export default function ApplicationSlideDrawer({
       }
     }, 2000);
 
-    // Supabase Realtime channel for instant updates
-    let channel = null;
-    if (targetTaskId) {
-      channel = supabase
-        .channel(`drawer_task_sub_${targetTaskId}`)
-        .on('postgres_changes', {
-          event: '*',
-          schema: 'public',
-          table: 'submission_tasks',
-          filter: `id=eq.${targetTaskId}`,
-        }, (payload) => {
-          const fresh = payload.new;
-          if (!fresh || !isMounted) return;
-          const shot = resolveSupabaseStorageUrl(fresh.application_submitted_screenshot_url || null);
-          setAppDetails((prev) => ({
+    // Supabase Realtime channel scoped strictly by distribution_id
+    const channel = supabase
+      .channel(`drawer_dist_sub_${currentDistId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'submission_tasks',
+        filter: `distribution_id=eq.${currentDistId}`,
+      }, (payload) => {
+        const fresh = payload.new;
+        if (!fresh || !isMounted || fresh.distribution_id !== currentDistId) return;
+        const isFinal = fresh.status === 'submitted' || fresh.status === 'completed' || fresh.status === 'failed';
+        const shot = isFinal ? resolveSupabaseStorageUrl(fresh.application_submitted_screenshot_url || null) : null;
+        setAppDetails((prev) => {
+          if (prev && prev.distributionId && prev.distributionId !== currentDistId) return prev;
+          return {
             ...prev,
+            id: currentDistId,
+            distributionId: currentDistId,
+            taskId: fresh.id,
+            task_id: fresh.id,
             status: fresh.status,
-            worker_id: fresh.worker_id || prev?.worker_id,
-            screenshotUrl: shot || prev?.screenshotUrl,
-            application_submitted_screenshot_url: shot || prev?.application_submitted_screenshot_url,
-          }));
+            worker_id: fresh.worker_id || null,
+            screenshotUrl: shot,
+            application_submitted_screenshot_url: shot,
+            error_message: fresh.error_message || null,
+          };
+        });
 
-          if (fresh.status === 'submitted') {
-            setSubmitting(false);
-            setActionMessage('✓ Application successfully submitted on Workday! Proof screenshot captured.');
-            if (onStatusUpdated) {
-              onStatusUpdated({
-                ...application,
-                taskId: fresh.id,
-                task_id: fresh.id,
-                status: 'submitted',
-                worker_id: fresh.worker_id,
-                application_submitted_screenshot_url: shot,
-                screenshot_url: shot,
-              });
-            }
+        if (fresh.status === 'submitted') {
+          setSubmitting(false);
+          setActionMessage('✓ Application successfully submitted on Workday! Proof screenshot captured.');
+          if (onStatusUpdated) {
+            onStatusUpdated({
+              ...application,
+              id: currentDistId,
+              distributionId: currentDistId,
+              taskId: fresh.id,
+              task_id: fresh.id,
+              status: 'submitted',
+              worker_id: fresh.worker_id,
+              application_submitted_screenshot_url: shot,
+              screenshot_url: shot,
+            });
           }
-        })
-        .subscribe();
-    }
+        } else if (fresh.status === 'failed') {
+          setSubmitting(false);
+          setActionMessage(`⚠️ Application failed: ${fresh.error_message || 'Submission failed'}`);
+        }
+      })
+      .subscribe();
 
     return () => {
       isMounted = false;
       clearInterval(interval);
-      if (channel) supabase.removeChannel(channel);
+      supabase.removeChannel(channel);
     };
-  }, [isOpen, distributionId, applywizzId, jobUrl, appDetails?.taskId, appDetails?.task_id, application?.taskId, application?.task_id]);
+  }, [isOpen, distributionId]);
 
   // Missing / Unanswered Questions
   const missingFields = useMemo(() => {
@@ -410,7 +444,7 @@ export default function ApplicationSlideDrawer({
         setSubmitting(false);
         setAppDetails((prev) => ({ ...prev, status: 'ready_for_review' }));
         if (onStatusUpdated) {
-          onStatusUpdated({ ...application, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
+          onStatusUpdated({ ...application, id: distributionId, distributionId, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
         }
         return;
       }
@@ -421,7 +455,7 @@ export default function ApplicationSlideDrawer({
       setSubmitting(false);
       setAppDetails((prev) => ({ ...prev, status: 'ready_for_review' }));
       if (onStatusUpdated) {
-        onStatusUpdated({ ...application, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
+        onStatusUpdated({ ...application, id: distributionId, distributionId, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
       }
     }
   };
@@ -458,16 +492,11 @@ export default function ApplicationSlideDrawer({
   }
 
   const isFinalSubmitted = effectiveStatus.includes('submit') || effectiveStatus === 'completed';
-  const rawProofShot = isFinalSubmitted
-    ? (appDetails?.application_submitted_screenshot_url
-      || application?.application_submitted_screenshot_url
-      || appDetails?.screenshot_path
-      || application?.screenshot_path
-      || appDetails?.applied_screenshot
-      || application?.applied_screenshot
-      || appDetails?.screenshot_url
-      || application?.screenshot_url
-      || null)
+  const isFailedState = effectiveStatus.includes('fail') || effectiveStatus.includes('err');
+
+  // D4: Use application_submitted_screenshot_url of that row only
+  const rawProofShot = (isFinalSubmitted || isFailedState)
+    ? (appDetails?.application_submitted_screenshot_url || null)
     : null;
 
   const proofShot = resolveSupabaseStorageUrl(rawProofShot);
@@ -871,7 +900,61 @@ export default function ApplicationSlideDrawer({
               Close
             </button>
 
-            {effectiveStatus !== 'submitted' ? (
+            {isFinalSubmitted ? (
+              <button
+                type="button"
+                className="sd-btn-primary"
+                disabled={!proofShot}
+                onClick={() => {
+                  if (!proofShot) return;
+                  setSelectedScreenshot({
+                    url: proofShot,
+                    company: appDetails?.company,
+                    role: appDetails?.roleTitle,
+                    status: 'submitted',
+                  });
+                }}
+                style={{
+                  background: proofShot ? 'linear-gradient(135deg, #10b981 0%, #059669 100%)' : 'rgba(51, 65, 85, 0.4)',
+                  color: proofShot ? '#ffffff' : '#64748b',
+                  border: proofShot ? '1px solid #34d399' : '1px solid #334155',
+                  boxShadow: proofShot ? '0 4px 14px rgba(16, 185, 129, 0.35)' : 'none',
+                  cursor: proofShot ? 'pointer' : 'not-allowed',
+                  opacity: proofShot ? 1 : 0.6,
+                }}
+                title={proofShot ? "View verified submission screenshot" : "No submission screenshot available"}
+              >
+                <Eye size={15} />
+                <span>Submission screenshot</span>
+              </button>
+            ) : isFailedState ? (
+              <button
+                type="button"
+                className="sd-btn-primary"
+                disabled={!proofShot}
+                onClick={() => {
+                  if (!proofShot) return;
+                  setSelectedScreenshot({
+                    url: proofShot,
+                    company: appDetails?.company,
+                    role: appDetails?.roleTitle,
+                    status: 'failed',
+                  });
+                }}
+                style={{
+                  background: proofShot ? 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)' : 'rgba(51, 65, 85, 0.4)',
+                  color: proofShot ? '#ffffff' : '#64748b',
+                  border: proofShot ? '1px solid #f87171' : '1px solid #334155',
+                  boxShadow: proofShot ? '0 4px 14px rgba(239, 68, 68, 0.35)' : 'none',
+                  cursor: proofShot ? 'pointer' : 'not-allowed',
+                  opacity: proofShot ? 1 : 0.6,
+                }}
+                title={proofShot ? "View failure screenshot" : "No failure screenshot available"}
+              >
+                <Eye size={15} />
+                <span>Failure screenshot</span>
+              </button>
+            ) : (
               <button
                 type="button"
                 className="sd-btn-primary"
@@ -909,25 +992,6 @@ export default function ApplicationSlideDrawer({
                       ? '⚡ Applying on Workday...'
                       : (missingFields.length > 0 ? `Needs Answers (${missingFields.length})` : 'Review & Submit')}
                 </span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="sd-btn-primary"
-                onClick={() => setSelectedScreenshot(proofShot || {
-                  url: appDetails?.screenshotUrl || appDetails?.application_submitted_screenshot_url,
-                  company: appDetails?.company,
-                  status: 'submitted',
-                  isPlaceholder: !proofShot,
-                })}
-                style={{
-                  background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                  border: '1px solid #34d399',
-                  boxShadow: '0 4px 14px rgba(16, 185, 129, 0.35)',
-                }}
-              >
-                <Eye size={15} />
-                <span>View Submission Proof</span>
               </button>
             )}
           </div>
