@@ -10,6 +10,7 @@
 import { loadLocalEnvOnce } from './supabaseClient.mjs';
 import { createClient } from '@supabase/supabase-js';
 import { updateWorkerStatus } from './supabaseClient.mjs';
+import { getWorkerContext } from './browserLifecycle.mjs';
 
 loadLocalEnvOnce();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -22,6 +23,103 @@ export const SUBMISSION_WORKER_IDS = [
   'submitting_worker_5',
   'submitting_worker_6',
 ];
+
+/**
+ * B1 Helper: Updates submission_tasks, checks { data, error },
+ * verifies rows changed > 0, retries up to 3 times, and logs error.
+ */
+export async function updateSubmissionTaskWithCheck({
+  taskId,
+  workerId,
+  patch,
+  maxRetries = 3,
+}) {
+  let lastErr = null;
+  const cleanTaskId = String(taskId).trim();
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { data, error } = await supabase
+        .from('submission_tasks')
+        .update(patch)
+        .eq('id', cleanTaskId)
+        .eq('status', 'applying')
+        .eq('worker_id', workerId)
+        .select('*');
+
+      if (error) {
+        lastErr = new Error(`Supabase update error: ${error.message} (code: ${error.code || 'unknown'})`);
+        console.warn(`[${workerId}] Warning: updateSubmissionTaskWithCheck attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+        if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+
+      if (!data || data.length === 0) {
+        lastErr = new Error(`Zero rows updated. Task #${cleanTaskId} was not in 'applying' state or worker_id mismatch (expected ${workerId})`);
+        console.warn(`[${workerId}] Warning: updateSubmissionTaskWithCheck attempt ${attempt}/${maxRetries} matched 0 rows for task #${cleanTaskId}`);
+        if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+
+      console.log(`[${workerId}] task row updated (rows=${data.length}) for task #${cleanTaskId} -> status: ${patch.status || 'updated'}`);
+      return { success: true, data: data[0], rowsCount: data.length };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+    }
+  }
+
+  const finalErrMsg = `[${workerId}] ERROR: Failed to update submission_task #${cleanTaskId} after ${maxRetries} attempts: ${lastErr?.message}`;
+  console.error(finalErrMsg);
+  return { success: false, error: lastErr || new Error(finalErrMsg) };
+}
+
+/**
+ * B7 Helper: Checked update for job_distributions
+ */
+export async function updateJobDistributionWithCheck({
+  distributionId,
+  workerId = 'worker',
+  patch,
+  maxRetries = 3,
+}) {
+  if (!distributionId) return { success: false, error: new Error('No distributionId provided') };
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { data, error } = await supabase
+        .from('job_distributions')
+        .update(patch)
+        .eq('id', distributionId)
+        .select('*');
+
+      if (error) {
+        lastErr = new Error(`Supabase update error on job_distributions: ${error.message}`);
+        console.warn(`[${workerId}] Warning: updateJobDistributionWithCheck attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+        if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+
+      if (!data || data.length === 0) {
+        lastErr = new Error(`Zero rows updated on job_distributions for #${distributionId}`);
+        console.warn(`[${workerId}] Warning: updateJobDistributionWithCheck attempt ${attempt}/${maxRetries} matched 0 rows for #${distributionId}`);
+        if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+
+      console.log(`[${workerId}] job_distributions record updated to '${patch.status || 'updated'}' (rows=${data.length}) for dist #${distributionId}`);
+      return { success: true, data: data[0], rowsCount: data.length };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 200 * attempt));
+    }
+  }
+
+  const finalErrMsg = `[${workerId}] ERROR: Failed to update job_distributions #${distributionId} after ${maxRetries} attempts: ${lastErr?.message}`;
+  console.error(finalErrMsg);
+  return { success: false, error: lastErr || new Error(finalErrMsg) };
+}
 
 /**
  * Atomic Task Claim (FOR UPDATE SKIP LOCKED)
@@ -164,7 +262,7 @@ export async function reapExpiredLeases(timeoutMinutes = 10) {
  * - Runs with isolated Playwright browser context
  * - Emits periodic heartbeats
  */
-export async function processClaimedTask({ task, workerId, headless = true, runnerFn = null }) {
+export async function processClaimedTask({ task, workerId, headless = true, runnerFn = null, options = {} }) {
   if (!task || !workerId) return { success: false, error: 'Invalid task or workerId' };
 
   console.log(`\n🚀 [${workerId}] Processing task #${task.id} (${task.applywizz_id} @ ${task.company || 'Company'})...`);
@@ -179,137 +277,232 @@ export async function processClaimedTask({ task, workerId, headless = true, runn
   }).catch(() => { });
 
   // Start 30-second heartbeat interval
+  let heartbeatActive = true;
   const heartbeatTimer = setInterval(() => {
-    sendTaskHeartbeat(task.id, workerId).catch(() => { });
+    if (heartbeatActive) {
+      sendTaskHeartbeat(task.id, workerId).catch(() => { });
+    }
   }, 30_000);
+
+  function stopHeartbeat() {
+    heartbeatActive = false;
+    clearInterval(heartbeatTimer);
+  }
+
+  // B4 Task Watchdog: hard limit of 8 minutes per task
+  const WATCHDOG_TIMEOUT_MS = options?.watchdogTimeoutMs || 8 * 60 * 1000;
+  let watchdogTimer = null;
 
   let result = null;
   try {
-    if (runnerFn) {
-      // Custom or test runner function
-      result = await runnerFn(task, workerId);
-    } else {
-      // Default Playwright runner via workerPool
-      const { executeWorkerTask } = await import('./workerPool.mjs');
-      result = await executeWorkerTask({
-        task: {
-          id: task.distribution_id,
-          applywizzId: task.applywizz_id,
-          jobUrl: task.job_url,
-          company: task.company,
-          roleTitle: task.role_title,
-          status: 'approved_for_submission',
-        },
-        workerId,
-        taskIndex: 1,
-        totalTasks: 1,
-        options: {
-          headless: Boolean(headless),
-          confirmSubmit: true,
-          dryRun: false,
-        },
-      });
-    }
+    const taskExecutionPromise = (async () => {
+      if (runnerFn) {
+        return await runnerFn(task, workerId);
+      } else {
+        const { executeWorkerTask } = await import('./workerPool.mjs');
+        return await executeWorkerTask({
+          task: {
+            id: task.distribution_id,
+            distributionId: task.distribution_id,
+            taskId: task.id,
+            applywizzId: task.applywizz_id,
+            jobUrl: task.job_url,
+            company: task.company,
+            roleTitle: task.role_title,
+            status: 'approved_for_submission',
+          },
+          taskId: task.id,
+          workerId,
+          taskIndex: 1,
+          totalTasks: 1,
+          options: {
+            headless: Boolean(headless),
+            confirmSubmit: true,
+            dryRun: false,
+            taskId: task.id,
+          },
+        });
+      }
+    })();
+
+    const watchdogPromise = new Promise((resolve) => {
+      watchdogTimer = setTimeout(async () => {
+        console.log(`[${workerId}] watchdog fired: task timed out after 8 minutes (task #${task.id})`);
+        stopHeartbeat();
+
+        let shotPath = null;
+        let shotUrl = null;
+        try {
+          const ctx = getWorkerContext(workerId);
+          if (ctx?.page && !ctx.page.isClosed()) {
+            const buf = await ctx.page.screenshot({ type: 'png', timeout: 5000 }).catch(() => null);
+            if (buf) {
+              const cleanId = String(task.applywizz_id).trim().toUpperCase();
+              const timestamp = Date.now();
+              shotPath = `${cleanId}/${task.id}_failed_${timestamp}.png`;
+              const { error: upErr } = await supabase.storage
+                .from('submitted-applications')
+                .upload(shotPath, buf, { contentType: 'image/png', upsert: true });
+              if (!upErr) {
+                const { data: urlData } = supabase.storage
+                  .from('submitted-applications')
+                  .getPublicUrl(shotPath);
+                shotUrl = urlData?.publicUrl || null;
+                console.log(`[${workerId}] screenshot uploaded: ${shotPath}`);
+              }
+            }
+          }
+          if (ctx?.browser) {
+            await ctx.browser.close().catch(() => {});
+          }
+        } catch (wShotErr) {
+          console.warn(`[${workerId}] Watchdog screenshot error:`, wShotErr.message);
+        }
+
+        resolve({
+          status: 'failed',
+          isTimeout: true,
+          error: 'Task timed out after 8 minutes',
+          screenshotUrl: shotUrl,
+          screenshotPath: shotPath,
+        });
+      }, WATCHDOG_TIMEOUT_MS);
+    });
+
+    result = await Promise.race([taskExecutionPromise, watchdogPromise]);
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    stopHeartbeat();
+
     const now = new Date().toISOString();
     const isSuccess = result?.status === 'submitted' || result?.status === 'success';
-    const finalShot = result?.screenshotUrl || result?.reviewScreenshotUrl || null;
+
+    let finalShotUrl = result?.screenshotUrl || result?.reviewScreenshotUrl || null;
+    let finalStoragePath = result?.screenshotPath || null;
+    if (!finalStoragePath && finalShotUrl) {
+      const cleanId = String(task.applywizz_id).trim().toUpperCase();
+      finalStoragePath = `${cleanId}/${task.id}.png`;
+    }
 
     if (isSuccess) {
-      try {
-        await supabase
-          .from('submission_tasks')
-          .update({
-            status: 'submitted',
-            completed_at: now,
-            application_submitted_screenshot_url: finalShot,
-            screenshot_path: finalShot,
-            updated_at: now,
-          })
-          .eq('id', task.id);
-      } catch (stUpErr) {
-        console.warn(`[${workerId}] Warning updating submission_tasks to submitted:`, stUpErr?.message);
-      }
+      await updateSubmissionTaskWithCheck({
+        taskId: task.id,
+        workerId,
+        patch: {
+          status: 'submitted',
+          completed_at: now,
+          application_submitted_screenshot_url: finalShotUrl,
+          screenshot_path: finalStoragePath,
+          updated_at: now,
+        },
+      });
 
       if (task.distribution_id) {
-        try {
-          await supabase
-            .from('job_distributions')
-            .update({
-              status: 'submitted',
-              application_submitted_screenshot_url: finalShot,
-              updated_at: now,
-            })
-            .eq('id', task.distribution_id);
-        } catch (jdUpErr) {
-          console.warn(`[${workerId}] Warning updating job_distributions to submitted:`, jdUpErr?.message);
-        }
+        await updateJobDistributionWithCheck({
+          distributionId: task.distribution_id,
+          workerId,
+          patch: {
+            status: 'submitted',
+            application_submitted_screenshot_url: finalShotUrl,
+            updated_at: now,
+          },
+        });
       }
     } else {
       const errMsg = result?.error || result?.reason || `Submission ended with status: ${result?.status || 'failed'}`;
-      try {
-        await supabase
-          .from('submission_tasks')
-          .update({
-            status: 'failed',
-            error_message: errMsg,
-            completed_at: now,
-            application_submitted_screenshot_url: finalShot,
-            screenshot_path: finalShot,
-            updated_at: now,
-          })
-          .eq('id', task.id);
-      } catch (stFailErr) {
-        console.warn(`[${workerId}] Warning updating submission_tasks to failed:`, stFailErr?.message);
-      }
+      await updateSubmissionTaskWithCheck({
+        taskId: task.id,
+        workerId,
+        patch: {
+          status: 'failed',
+          error_message: errMsg,
+          completed_at: now,
+          application_submitted_screenshot_url: finalShotUrl,
+          screenshot_path: finalStoragePath,
+          updated_at: now,
+        },
+      });
 
       if (task.distribution_id) {
-        try {
-          await supabase
-            .from('job_distributions')
-            .update({
-              status: 'failed',
-              error_message: errMsg,
-              application_submitted_screenshot_url: finalShot,
-              updated_at: now,
-            })
-            .eq('id', task.distribution_id);
-        } catch (jdFailErr) {
-          console.warn(`[${workerId}] Warning updating job_distributions to failed:`, jdFailErr?.message);
-        }
+        await updateJobDistributionWithCheck({
+          distributionId: task.distribution_id,
+          workerId,
+          patch: {
+            status: 'failed',
+            error_message: errMsg,
+            application_submitted_screenshot_url: finalShotUrl,
+            updated_at: now,
+          },
+        });
       }
     }
   } catch (err) {
+    stopHeartbeat();
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+
     result = {
       status: 'failed',
       error: err?.message || 'Execution error',
     };
     const now = new Date().toISOString();
+
+    // B3: In exception catch block, take screenshot before page closes, upload it
+    let errShotUrl = null;
+    let errShotPath = null;
     try {
-      await supabase
-        .from('submission_tasks')
-        .update({
-          status: 'failed',
-          error_message: err?.message || 'Execution error',
-          completed_at: now,
-          updated_at: now,
-        })
-        .eq('id', task.id);
-    } catch { }
+      const ctx = getWorkerContext(workerId);
+      if (ctx?.page && !ctx.page.isClosed()) {
+        const buf = await ctx.page.screenshot({ type: 'png', timeout: 5000 }).catch(() => null);
+        if (buf) {
+          const cleanId = String(task.applywizz_id).trim().toUpperCase();
+          const timestamp = Date.now();
+          errShotPath = `${cleanId}/${task.id}_failed_${timestamp}.png`;
+          const { error: upErr } = await supabase.storage
+            .from('submitted-applications')
+            .upload(errShotPath, buf, { contentType: 'image/png', upsert: true });
+          if (!upErr) {
+            const { data: urlData } = supabase.storage
+              .from('submitted-applications')
+              .getPublicUrl(errShotPath);
+            errShotUrl = urlData?.publicUrl || null;
+            console.log(`[${workerId}] screenshot uploaded: ${errShotPath}`);
+          }
+        }
+      }
+    } catch (catchShotErr) {
+      console.warn(`[${workerId}] Exception screenshot capture error:`, catchShotErr.message);
+    }
+
+    result.screenshotUrl = errShotUrl;
+    result.screenshotPath = errShotPath;
+
+    await updateSubmissionTaskWithCheck({
+      taskId: task.id,
+      workerId,
+      patch: {
+        status: 'failed',
+        error_message: err?.message || 'Execution error',
+        completed_at: now,
+        application_submitted_screenshot_url: errShotUrl,
+        screenshot_path: errShotPath,
+        updated_at: now,
+      },
+    });
 
     if (task.distribution_id) {
-      try {
-        await supabase
-          .from('job_distributions')
-          .update({
-            status: 'failed',
-            error_message: err?.message || 'Execution error',
-            updated_at: now,
-          })
-          .eq('id', task.distribution_id);
-      } catch { }
+      await updateJobDistributionWithCheck({
+        distributionId: task.distribution_id,
+        workerId,
+        patch: {
+          status: 'failed',
+          error_message: err?.message || 'Execution error',
+          application_submitted_screenshot_url: errShotUrl,
+          updated_at: now,
+        },
+      });
     }
   } finally {
-    clearInterval(heartbeatTimer);
+    stopHeartbeat();
+    if (watchdogTimer) clearTimeout(watchdogTimer);
     // Release worker back to idle
     await updateWorkerStatus(workerId, {
       state: 'idle',
@@ -322,3 +515,4 @@ export async function processClaimedTask({ task, workerId, headless = true, runn
 
   return result;
 }
+

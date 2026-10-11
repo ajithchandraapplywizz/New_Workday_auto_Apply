@@ -27,7 +27,7 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
   // Active CA identity (strictly scoped to logged-in operator session)
   const [caRoster, setCaRoster] = useState([]);
   const [sessionCaEmail, setSessionCaEmail] = useState(
-    user?.email && user?.email.includes('@') ? user.email.toLowerCase().trim() : 'manasa@applywizz.com'
+    user?.email && user?.email.includes('@') ? user.email.toLowerCase().trim() : ''
   );
 
   // Synchronize with logged in operator session

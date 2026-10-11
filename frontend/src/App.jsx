@@ -11,12 +11,24 @@ import LoginPage from './pages/LoginPage';
 import './App.css';
 
 function MainLayout() {
-  const { user, isAuthModalOpen, setIsAuthModalOpen } = useAuth();
+  const { user, isAuthModalOpen, setIsAuthModalOpen, isVerifyingSession, authError } = useAuth();
   const [operatorView, setOperatorView] = useState('dashboard'); // 'dashboard' | 'stats' | 'review'
 
-  // If not logged in, render the dedicated professional LoginPage
-  if (!user) {
-    return <LoginPage />;
+  const allowedRoles = ['ca', 'operator', 'admin', 'manager', 'dev', 'developer'];
+  const isStaff = user && allowedRoles.includes(user.role?.toLowerCase());
+
+  // Show verifying state while session is being verified to prevent any flash of dashboard
+  if (isVerifyingSession && user) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0d14', color: '#94a3b8' }}>
+        <span>Verifying authorization...</span>
+      </div>
+    );
+  }
+
+  // If not logged in or not authorized staff, render LoginPage with Access Denied and NEVER render dashboard
+  if (!user || !isStaff) {
+    return <LoginPage accessDenied={Boolean(user && !isStaff) || Boolean(authError)} />;
   }
 
   return (

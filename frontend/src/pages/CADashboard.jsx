@@ -73,7 +73,7 @@ export default function CADashboard() {
     }
     return user?.email && user?.email.includes('@')
       ? user.email.toLowerCase().trim()
-      : 'sana@applywizz.com';
+      : '';
   }, [user?.email, inspectedCaEmail]);
 
   // Workday Auto-Apply Dynamic state
@@ -198,24 +198,6 @@ export default function CADashboard() {
       })
     );
   };
-
-  // Record CA's active status in Supabase upon viewing the console
-  useEffect(() => {
-    if (!activeCaEmail) return;
-    const nowIso = new Date().toISOString();
-    supabase
-      .from('operators')
-      .update({ status: 'active', updated_at: nowIso })
-      .ilike('email', activeCaEmail)
-      .then(() => {})
-      .catch(() => {});
-    supabase
-      .from('auth_users')
-      .update({ status: 'active', updated_at: nowIso, last_sign_in: nowIso })
-      .ilike('email', activeCaEmail)
-      .then(() => {})
-      .catch(() => {});
-  }, [activeCaEmail]);
 
   // Dynamically load assigned candidates for this CA from yesterday's work history
   useEffect(() => {

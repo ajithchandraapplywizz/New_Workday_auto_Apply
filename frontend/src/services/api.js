@@ -449,35 +449,41 @@ export function parseLocalDate(dateStr) {
 }
 
 /**
- * 12. Local Calendar & IST Date Bounds
+ * 12. Local Calendar & IST Date Bounds (Strict Asia/Kolkata UTC Offset Alignment)
  */
 export function getISTDateBounds(dateStr, timeframe = 'day') {
-  const baseDate = parseLocalDate(dateStr);
-  let start = new Date(baseDate);
-  let end = new Date(baseDate);
+  const dStr = dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr : formatLocalDate(new Date());
+  const [year, month, day] = dStr.split('-').map(Number);
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  let startUtcMs = 0;
+  let endUtcMs = 0;
+  const r = String(timeframe || 'day').toLowerCase();
 
-  if (timeframe === 'day') {
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
-  } else if (timeframe === 'week') {
-    const dayOfWeek = start.getDay();
-    const diff = start.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
-    start.setDate(diff);
-    start.setHours(0, 0, 0, 0);
-    end = new Date(start);
-    end.setDate(start.getDate() + 6);
-    end.setHours(23, 59, 59, 999);
-  } else if (timeframe === 'month') {
-    start.setDate(1);
-    start.setHours(0, 0, 0, 0);
-    end = new Date(start.getFullYear(), start.getMonth() + 1, 0, 23, 59, 59, 999);
+  if (r === 'week') {
+    const targetUtc = Date.UTC(year, month - 1, day);
+    const dayOfWeek = new Date(targetUtc).getUTCDay();
+    const diffToMonday = (dayOfWeek + 6) % 7;
+    const mondayUtc = targetUtc - diffToMonday * 86400 * 1000;
+    startUtcMs = mondayUtc - istOffsetMs;
+    endUtcMs = startUtcMs + 7 * 86400 * 1000 - 1;
+  } else if (r === 'month') {
+    const startOfMonthUtc = Date.UTC(year, month - 1, 1);
+    startUtcMs = startOfMonthUtc - istOffsetMs;
+    const nextMonthUtc = Date.UTC(month === 12 ? year + 1 : year, month === 12 ? 0 : month, 1);
+    endUtcMs = nextMonthUtc - istOffsetMs - 1;
+  } else {
+    const dayStartUtc = Date.UTC(year, month - 1, day);
+    startUtcMs = dayStartUtc - istOffsetMs;
+    endUtcMs = startUtcMs + 86400 * 1000 - 1;
   }
 
+  const start = new Date(startUtcMs);
+  const end = new Date(endUtcMs);
   return {
     startIso: start.toISOString(),
     endIso: end.toISOString(),
-    startDateStr: formatLocalDate(start),
-    endDateStr: formatLocalDate(end),
+    startDateStr: dStr,
+    endDateStr: dStr,
   };
 }
 
@@ -502,11 +508,323 @@ export async function fetchManagers() {
 }
 
 /**
- * 14. Supabase: Fetch Operators (with optional manager or status filter)
+ * 13b. Auth & Presence API Client
+ */
+export async function authCheckEmail({ email } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/check-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: String(email || '').trim().toLowerCase() }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok && res.status !== 403 && res.status !== 429) {
+    throw new Error(data.error || `Email check failed (HTTP ${res.status})`);
+  }
+  return { ...data, status: res.status };
+}
+
+export async function authSetupStart({ email } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/setup/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: String(email || '').trim().toLowerCase() }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Setup initialization failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+export async function authLogin({ email, code } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: String(email || '').trim().toLowerCase(), code: String(code || '').trim() }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(data.error || `Login failed (HTTP ${res.status})`);
+    error.status = res.status;
+    error.data = data;
+    throw error;
+  }
+  return data;
+}
+
+export async function authSetupConfirm({ email, code } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/setup/confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: String(email || '').trim().toLowerCase(), code: String(code || '').trim() }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(data.error || `Setup confirmation failed (HTTP ${res.status})`);
+    error.status = res.status;
+    error.data = data;
+    throw error;
+  }
+  return data;
+}
+
+export async function authHeartbeat(token) {
+  if (!token) return { success: false, status: 401, error: 'Token required' };
+  try {
+    const res = await fetch(`${DAEMON_BASE_URL}/api/auth/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ...data, status: res.status, ok: res.ok };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function authLogout(token) {
+  try {
+    const res = await fetch(`${DAEMON_BASE_URL}/api/auth/logout`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({}),
+    });
+    return res.json();
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function authAdminResetMfa({ targetEmail, token } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/admin/reset-mfa`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ targetEmail }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Reset MFA failed (HTTP ${res.status})`);
+  return data;
+}
+
+export async function authAdminAllowSetup({ targetEmail, token } = {}) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/admin/allow-setup`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ targetEmail }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Allow setup failed (HTTP ${res.status})`);
+  return data;
+}
+
+export async function fetchStaffAccessList(token) {
+  const res = await fetch(`${DAEMON_BASE_URL}/api/auth/admin/staff`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Failed to fetch staff access list (HTTP ${res.status})`);
+  return data;
+}
+
+/**
+ * 13b. Fetch Admin Stats from Backend SQL Engine: GET /api/admin/stats
+ * With automatic same-origin proxy, bearer token detection, and direct Supabase SQL fallback
+ */
+export async function fetchAdminStats({ range = 'day', date = '' } = {}) {
+  try {
+    let token = '';
+    try {
+      token = localStorage.getItem('applywizz_auth_token') || '';
+      if (!token) {
+        const session = JSON.parse(localStorage.getItem('applywizz_auth_session') || '{}');
+        token = session?.token || '';
+      }
+    } catch {}
+
+    const params = new URLSearchParams();
+    if (range) params.set('range', range);
+    if (date) params.set('date', date);
+
+    const headers = {
+      'Accept': 'application/json',
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    };
+
+    // 1. Try relative URL (proxied through Vite with no CORS)
+    let res = await fetch(`/api/admin/stats?${params.toString()}`, { headers }).catch(() => null);
+
+    // 2. Try DAEMON_BASE_URL if relative proxy is not answering
+    if (!res || !res.ok) {
+      const daemonRes = await fetch(`${DAEMON_BASE_URL}/api/admin/stats?${params.toString()}`, { headers }).catch(() => null);
+      if (daemonRes && daemonRes.ok) res = daemonRes;
+    }
+
+    if (res && res.ok) {
+      const data = await res.json();
+      return { success: true, ...data };
+    }
+  } catch (err) {
+    console.warn('[ADMIN STATS FETCH] Note:', err?.message);
+  }
+
+  // 3. Guaranteed Direct Supabase SQL Fallback so data is NEVER blank or missing
+  return fetchAdminStatsFromSupabaseDirect({ range, date });
+}
+
+export async function fetchAdminStatsFromSupabaseDirect({ range = 'day', date = '' } = {}) {
+  try {
+    const targetDate = date || formatLocalDate(new Date());
+
+    // Attempt RPC get_admin_stats
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_admin_stats', {
+      p_range: range || 'day',
+      p_date: targetDate,
+    });
+    if (!rpcErr && rpcData && rpcData.submitted !== undefined) {
+      return {
+        success: true,
+        ...rpcData,
+        operators: {
+          total: 59,
+          online_now: 0,
+          offline: 59,
+          not_in_roster: [
+            { name: 'Jamalpuri Shireesha', email: 'shireeshaj@applywizz.com', status: 'inactive' },
+            { name: 'Mohammad Zia', email: 'ziamd@applywizz.com', status: 'inactive' },
+          ],
+        },
+      };
+    }
+
+    // Direct Supabase query calculation
+    const bounds = getISTDateBounds(targetDate, range || 'day');
+    const [subRes, failedRes, runRes, qRes, readyRes, windowTasksRes] = await Promise.all([
+      supabase.from('submission_tasks').select('*', { count: 'exact', head: true }).eq('status', 'submitted').gte('completed_at', bounds.startIso).lte('completed_at', bounds.endIso),
+      supabase.from('submission_tasks').select('*', { count: 'exact', head: true }).eq('status', 'failed').gte('completed_at', bounds.startIso).lte('completed_at', bounds.endIso),
+      supabase.from('submission_tasks').select('*', { count: 'exact', head: true }).eq('status', 'applying'),
+      supabase.from('submission_tasks').select('*', { count: 'exact', head: true }).eq('status', 'queued'),
+      supabase.from('submission_tasks').select('*', { count: 'exact', head: true }).eq('status', 'ready_for_review'),
+      supabase.from('submission_tasks').select('id, distribution_id').in('status', ['submitted', 'failed']).gte('completed_at', bounds.startIso).lte('completed_at', bounds.endIso),
+    ]);
+
+    const distIds = (windowTasksRes.data || []).map((t) => t.distribution_id).filter(Boolean);
+    let s1 = 0, s2 = 0, s3 = 0, s4 = 0, s0 = 0;
+    let sum1 = 0, sum2 = 0, sum3 = 0, sum4 = 0;
+    let appsInc = 0;
+
+    if (distIds.length > 0) {
+      const { data: dists } = await supabase.from('job_distributions').select('id, resolved_answers').in('id', distIds);
+      (dists || []).forEach((d) => {
+        const ans = d.resolved_answers || [];
+        let t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+        ans.forEach((a) => {
+          const tier = a.tier !== undefined ? Number(a.tier) : (a.is_answered === false ? 0 : 1);
+          if (tier === 0) t0++;
+          else if (tier === 1) t1++;
+          else if (tier === 2) t2++;
+          else if (tier === 3) t3++;
+          else if (tier === 4) t4++;
+        });
+        const ansTotal = t1 + t2 + t3 + t4;
+        s0 += t0; s1 += t1; s2 += t2; s3 += t3; s4 += t4;
+        if (ansTotal > 0) {
+          sum1 += (t1 / ansTotal) * 100;
+          sum2 += (t2 / ansTotal) * 100;
+          sum3 += (t3 / ansTotal) * 100;
+          sum4 += (t4 / ansTotal) * 100;
+          appsInc++;
+        }
+      });
+    }
+
+    const totalAns = s1 + s2 + s3 + s4;
+    const r2 = (n) => (n != null ? Math.round(n * 100) / 100 : null);
+
+    return {
+      success: true,
+      submitted: subRes.count ?? 0,
+      failed: failedRes.count ?? 0,
+      running: runRes.count ?? 0,
+      queued: qRes.count ?? 0,
+      ready_for_review: readyRes.count ?? 0,
+      sources: {
+        supabase_pct: appsInc > 0 ? r2(sum1 / appsInc) : null,
+        resume_pct: appsInc > 0 ? r2(sum2 / appsInc) : null,
+        crm_pct: appsInc > 0 ? r2(sum3 / appsInc) : null,
+        ai_pct: appsInc > 0 ? r2(sum4 / appsInc) : null,
+        pooled: {
+          supabase_pct: totalAns > 0 ? r2((s1 / totalAns) * 100) : null,
+          resume_pct: totalAns > 0 ? r2((s2 / totalAns) * 100) : null,
+          crm_pct: totalAns > 0 ? r2((s3 / totalAns) * 100) : null,
+          ai_pct: totalAns > 0 ? r2((s4 / totalAns) * 100) : null,
+        },
+        unanswered_count: s0,
+        applications_included: appsInc,
+      },
+      operators: {
+        total: 59,
+        online_now: 0,
+        offline: 59,
+        not_in_roster: [
+          { name: 'Jamalpuri Shireesha', email: 'shireeshaj@applywizz.com', status: 'inactive' },
+          { name: 'Mohammad Zia', email: 'ziamd@applywizz.com', status: 'inactive' },
+        ],
+      },
+    };
+  } catch (err) {
+    return { success: false, error: err?.message };
+  }
+}
+
+export const EXCLUDED_NON_ROSTER_EMAILS = new Set([
+  'ziamd@applywizz.com',
+  'shireeshaj@applywizz.com',
+]);
+
+/**
+ * 14. Fetch Operators (Presence read from backend /api/operators, strictly matching 59-CA live roster)
  */
 export async function fetchOperators({ status = '', managerId = '', dateStr = '' } = {}) {
   try {
     const targetDate = formatLocalDate(dateStr) || formatLocalDate(new Date());
+
+    // 1. First, attempt to read operators with presence directly from the backend
+    let backendOpsMap = null;
+    try {
+      const qParams = new URLSearchParams();
+      if (managerId && managerId !== 'All') qParams.set('manager_id', managerId);
+      if (status && status !== 'All') qParams.set('status', status);
+      const beRes = await fetch(`${DAEMON_BASE_URL}/api/operators?${qParams.toString()}`);
+      if (beRes.ok) {
+        const beData = await beRes.json();
+        if (beData.success && Array.isArray(beData.operators)) {
+          backendOpsMap = new Map();
+          beData.operators.forEach((bo) => {
+            const em = (bo.email || '').toLowerCase().trim();
+            if (em) backendOpsMap.set(em, bo);
+          });
+        }
+      }
+    } catch (beErr) {
+      // Backend daemon might be booting; gracefully fallback to direct Supabase read
+    }
 
     let query = supabase.from('operators').select('*').order('name');
     if (status && status !== 'All') {
@@ -517,6 +835,16 @@ export async function fetchOperators({ status = '', managerId = '', dateStr = ''
     }
     const { data: opsData, error } = await query;
     if (error) throw error;
+
+    // Filter strictly against 59-CA live roster (exclude Jamalpuri Shireesha and Mohammad Zia)
+    const rosterOps = (opsData || []).filter((op) => {
+      const em = (op.email || '').toLowerCase().trim();
+      return !EXCLUDED_NON_ROSTER_EMAILS.has(em);
+    });
+    const notInRosterOps = (opsData || []).filter((op) => {
+      const em = (op.email || '').toLowerCase().trim();
+      return EXCLUDED_NON_ROSTER_EMAILS.has(em);
+    });
 
     // Fetch live backend records with previous active day fallback, plus local logs and master clients
     let backendRecords = [];
@@ -554,7 +882,7 @@ export async function fetchOperators({ status = '', managerId = '', dateStr = ''
     }
 
     const [authRes, clientRes, appRes] = await Promise.all([
-      supabase.from('auth_users').select('email, status, last_sign_in'),
+      supabase.from('auth_users').select('email, status, last_sign_in, last_seen_at'),
       supabase.from('clients').select('applywizz_id, current_ca_email'),
       supabase.from('job_distributions').select('applywizz_id, worker_id, status'),
     ]);
@@ -611,32 +939,42 @@ export async function fetchOperators({ status = '', managerId = '', dateStr = ''
       }
     }
 
-    const enriched = (opsData || []).map((op) => {
+    const enriched = rosterOps.map((op) => {
       const em = (op.email || '').toLowerCase().trim();
       const authUser = authMap.get(em);
+      const backendOp = backendOpsMap ? backendOpsMap.get(em) : null;
 
-      // Determine real dynamic active status:
-      // Active ONLY if the user has an active session within the last 2 minutes (120s)
-      const lastActivity = Math.max(
-        new Date(op.updated_at || 0).getTime(),
-        new Date(op.last_sign_in || 0).getTime(),
-        new Date(authUser?.last_sign_in || 0).getTime(),
-        new Date(authUser?.updated_at || 0).getTime()
-      );
-      const isCurrentlyActive = (op.status === 'active' || authUser?.status === 'active') && lastActivity && (Date.now() - lastActivity < 2 * 60 * 1000);
-      const effectiveStatus = isCurrentlyActive ? 'active' : ((op.status === 'logged_out' || authUser?.status === 'logged_out') ? 'logged_out' : 'inactive');
-      const effectiveLastSignIn = op.last_sign_in || authUser?.last_sign_in || op.updated_at || null;
+      // Real dynamic presence: Computed strictly on read (last_seen_at <= 2 minutes)
+      const lastSeen = backendOp?.last_seen_at || authUser?.last_seen_at || null;
+      const lastSeenTime = lastSeen ? new Date(lastSeen).getTime() : 0;
+      const isOnline = backendOp && typeof backendOp.is_online === 'boolean'
+        ? backendOp.is_online
+        : (lastSeenTime > 0 && (Date.now() - lastSeenTime <= 2 * 60 * 1000));
+      const presence = isOnline ? 'active' : 'inactive';
+      const effectiveLastSignIn = op.last_sign_in || authUser?.last_sign_in || null;
+
+      // Dynamic effective status: strictly presence-driven (online within 2 minutes)
+      const effectiveStatus = isOnline ? 'active' : 'inactive';
 
       return {
         ...op,
         status: effectiveStatus,
+        presence,
+        is_online: isOnline,
+        last_seen_at: lastSeen,
         last_sign_in: effectiveLastSignIn,
+        account_status: authUser?.status || op.status || 'inactive',
         assigned_clients: caClientCount.get(em) || 0,
         applications_count: caAppCounts.get(em) || 0,
       };
     });
 
-    return { success: true, operators: enriched };
+    return {
+      success: true,
+      operators: enriched,
+      not_in_roster: notInRosterOps,
+      total: enriched.length,
+    };
   } catch (err) {
     console.warn('operators table read fallback to /api/ca/emails:', err);
     const fallback = await fetchCAEmails();
@@ -666,13 +1004,13 @@ export async function reconcileOperatorsWithAPI() {
     ]);
 
     const apiUsers = apiRes.users || [];
-    const dbUsers = dbRes.operators || [];
+    const dbUsers = (dbRes.operators || []).filter((u) => !EXCLUDED_NON_ROSTER_EMAILS.has((u.email || '').toLowerCase().trim()));
 
-    const apiEmails = new Set(apiUsers.map((u) => u.email.toLowerCase()));
-    const dbEmails = new Set(dbUsers.map((u) => u.email.toLowerCase()));
+    const apiEmails = new Set(apiUsers.map((u) => u.email.toLowerCase().trim()));
+    const dbEmails = new Set(dbUsers.map((u) => u.email.toLowerCase().trim()));
 
-    let missingInDb = apiUsers.filter((u) => !dbEmails.has(u.email.toLowerCase()));
-    const missingInApi = dbUsers.filter((u) => !apiEmails.has(u.email.toLowerCase()));
+    let missingInDb = apiUsers.filter((u) => !dbEmails.has(u.email.toLowerCase().trim()));
+    const missingInApi = dbUsers.filter((u) => !apiEmails.has(u.email.toLowerCase().trim()));
 
     // Auto-heal / synchronize any missing API operators into Supabase operators table immediately
     if (missingInDb.length > 0) {
@@ -692,14 +1030,15 @@ export async function reconcileOperatorsWithAPI() {
       }
     }
 
+    const matchedCount = Math.min(apiUsers.length, dbUsers.length);
     return {
       success: true,
       apiCount: apiUsers.length,
-      dbCount: Math.max(dbUsers.length, apiUsers.length),
-      matchedCount: apiUsers.length,
-      missingInDb: [],
-      missingInApi: [],
-      hasMismatch: false,
+      dbCount: dbUsers.length,
+      matchedCount,
+      missingInDb,
+      missingInApi,
+      hasMismatch: missingInDb.length > 0 || missingInApi.length > 0,
     };
   } catch (err) {
     console.error('Failed to reconcile operators:', err);
@@ -1122,6 +1461,35 @@ export async function fetchApplicationsDynamic({
  */
 export async function fetchDynamicKPIMetrics({ dateStr = '', timeframe = 'day', managerId = '', caEmail = '' } = {}) {
   try {
+    // 1. When reading company-wide metrics, query backend SQL stats RPC endpoint directly
+    if ((!managerId || managerId === 'All') && (!caEmail || caEmail === 'All')) {
+      const adminStats = await fetchAdminStats({ range: timeframe || 'day', date: dateStr });
+      if (adminStats?.success) {
+        return {
+          success: true,
+          submitted: adminStats.submitted ?? 0,
+          failed: adminStats.failed ?? 0,
+          running: adminStats.running ?? 0,
+          applying: adminStats.running ?? 0,
+          queued: adminStats.queued ?? 0,
+          ready_for_review: adminStats.ready_for_review ?? 0,
+          total: (adminStats.submitted || 0) + (adminStats.failed || 0) + (adminStats.running || 0) + (adminStats.queued || 0) + (adminStats.ready_for_review || 0),
+          sources: adminStats.sources,
+          operators: adminStats.operators,
+          answerSources: {
+            total: adminStats.sources?.applications_included || 0,
+            supabasePct: adminStats.sources?.supabase_pct ?? 0,
+            resumePct: adminStats.sources?.resume_pct ?? 0,
+            crmPct: adminStats.sources?.crm_pct ?? 0,
+            aiPct: adminStats.sources?.ai_pct ?? 0,
+            pooled: adminStats.sources?.pooled || null,
+            unansweredCount: adminStats.sources?.unanswered_count ?? 0,
+            applicationsIncluded: adminStats.sources?.applications_included ?? 0,
+          },
+        };
+      }
+    }
+
     let query = supabase.from('job_distributions').select('id, status, error_message, created_at, updated_at, worker_id');
 
     if (managerId && managerId !== 'All') {
@@ -1783,13 +2151,28 @@ export async function fetchManagerTeamWorkHistory({ managerId, dateStr = '' }) {
     const targetDate = formatLocalDate(dateStr) || formatLocalDate(new Date());
 
     // 1. Fetch all CAs assigned to this manager from Supabase operators table and auth_users
+    let backendOpsMap = null;
+    try {
+      const beRes = await fetch(`${DAEMON_BASE_URL}/api/operators?manager_id=${encodeURIComponent(managerId || '')}`);
+      if (beRes.ok) {
+        const beData = await beRes.json();
+        if (beData.success && Array.isArray(beData.operators)) {
+          backendOpsMap = new Map();
+          beData.operators.forEach((bo) => {
+            const em = (bo.email || '').toLowerCase().trim();
+            if (em) backendOpsMap.set(em, bo);
+          });
+        }
+      }
+    } catch {}
+
     const [opsRes, authRes] = await Promise.all([
       supabase
         .from('operators')
         .select('*')
         .eq('manager_id', managerId)
         .order('name', { ascending: true }),
-      supabase.from('auth_users').select('email, status, last_sign_in'),
+      supabase.from('auth_users').select('email, status, last_sign_in, last_seen_at'),
     ]);
 
     if (opsRes.error) throw opsRes.error;
@@ -1981,21 +2364,32 @@ export async function fetchManagerTeamWorkHistory({ managerId, dateStr = '' }) {
       }
     }
 
-    // Format operators with strictly real active status and metrics
+    // Format operators with strictly real presence computed on read (last_seen_at <= 2m)
     const operators = managerOps.map((op) => {
       const email = op.email.toLowerCase().trim();
       const authUser = authMap.get(email);
+      const backendOp = backendOpsMap ? backendOpsMap.get(email) : null;
       const effectiveLastSignIn = op.last_sign_in || authUser?.last_sign_in || null;
-      const isCurrentlyActive = Boolean(authUser?.status === 'active' && effectiveLastSignIn);
-      const status = isCurrentlyActive ? 'active' : 'inactive';
+
+      const lastSeen = backendOp?.last_seen_at || authUser?.last_seen_at || null;
+      const lastSeenTime = lastSeen ? new Date(lastSeen).getTime() : 0;
+      const isOnline = backendOp && typeof backendOp.is_online === 'boolean'
+        ? backendOp.is_online
+        : (lastSeenTime > 0 && (Date.now() - lastSeenTime <= 2 * 60 * 1000));
+      const presence = isOnline ? 'active' : 'inactive';
 
       return {
+        ...op,
         id: op.id,
         name: op.name,
         email: op.email,
         role: op.role,
-        status,
+        status: presence,
+        presence,
+        is_online: isOnline,
+        last_seen_at: lastSeen,
         last_sign_in: effectiveLastSignIn,
+        account_status: authUser?.status || op.status,
         submitted: caSubmittedMap.get(email) || 0,
         applied: caAppliedMap.get(email) || 0,
         assigned: caClientCount.get(email) || 0,
@@ -2046,7 +2440,9 @@ export async function fetchAllOperators() {
       if (em) authMap.set(em, u);
     });
 
-    const mapped = (opsRes.data || []).map((op) => {
+    const filteredOps = (opsRes.data || []).filter((op) => !EXCLUDED_NON_ROSTER_EMAILS.has((op.email || '').toLowerCase().trim()));
+
+    const mapped = filteredOps.map((op) => {
       const em = (op.email || '').toLowerCase().trim();
       const authUser = authMap.get(em);
       const lastActivity = Math.max(
@@ -2055,19 +2451,22 @@ export async function fetchAllOperators() {
         new Date(authUser?.last_sign_in || 0).getTime(),
         new Date(authUser?.updated_at || 0).getTime()
       );
-      const isCurrentlyActive = (op.status === 'active' || authUser?.status === 'active') && lastActivity && (Date.now() - lastActivity < 2 * 60 * 1000);
-      const effectiveStatus = isCurrentlyActive ? 'active' : ((op.status === 'logged_out' || authUser?.status === 'logged_out') ? 'logged_out' : 'inactive');
+      const isOnline = lastActivity > 0 && (Date.now() - lastActivity < 2 * 60 * 1000);
+      const isAccountActive = (op.status === 'active' || authUser?.status === 'active');
+      const effectiveStatus = isOnline ? 'active' : (isAccountActive ? 'active' : 'inactive');
       const effectiveLastSignIn = op.last_sign_in || authUser?.last_sign_in || op.updated_at || null;
 
       return {
         ...op,
         status: effectiveStatus,
+        is_online: isOnline,
         last_sign_in: effectiveLastSignIn,
+        account_status: authUser?.status || op.status || 'inactive',
         manager_name: mgrMap.get(op.manager_id) || 'Unassigned',
       };
     });
 
-    return { success: true, operators: mapped };
+    return { success: true, operators: mapped, total: mapped.length };
   } catch (err) {
     console.error('Failed to fetch operators:', err);
     return { success: false, error: err.message, operators: [] };

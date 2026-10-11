@@ -47,7 +47,7 @@ export default function ApplicationSlideDrawer({
   readOnly = false,
 }) {
   const auth = useAuth?.() || {};
-  const activeCaEmail = auth?.user?.email || 'sana@applywizz.com';
+  const activeCaEmail = auth?.user?.email || '';
 
   const [loading, setLoading] = useState(false);
   const [appDetails, setAppDetails] = useState(null);

@@ -202,18 +202,15 @@ export default function ManagerDashboard() {
     );
   };
 
-  // Helper: Live operator status considering 3-minute disconnect window
+  // Helper: Live operator status reading ONLY backend-computed presence
   const getOperatorEffectiveStatus = (op) => {
     if (!op) return 'inactive';
-    const raw = (op.status || '').toLowerCase();
-    if (raw === 'logged_out') return 'logged_out';
-    if (raw !== 'active') return 'inactive';
-    if (!op.updated_at && !op.last_sign_in) return 'inactive';
-    const last = new Date(op.updated_at || op.last_sign_in).getTime();
-    if (Date.now() - last > 3 * 60 * 1000) {
-      return 'inactive'; // Disconnected > 3 minutes
-    }
-    return 'active';
+    // Single source of truth: strictly backend op.presence ('active' | 'inactive')
+    if (op.presence) return (op.presence || '').toLowerCase() === 'active' ? 'active' : 'inactive';
+    if (typeof op.is_online === 'boolean') return op.is_online ? 'active' : 'inactive';
+    // Guarded legacy calculation bypassed per P1 rules:
+    // (Old fallback to op.status removed)
+    return 'inactive';
   };
 
   const handleBackFromDetails = () => {

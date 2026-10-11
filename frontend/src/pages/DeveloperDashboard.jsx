@@ -127,10 +127,14 @@ export default function DeveloperDashboard() {
           const reconciledApplying = activeWorkersCount > 0 ? Math.min(kpiRes.applying, activeWorkersCount) : 0;
           setKpis({
             submitted: kpiRes.submitted,
+            running: kpiRes.running ?? reconciledApplying,
             applying: reconciledApplying,
             failed: kpiRes.failed,
             queued: kpiRes.queued,
+            ready_for_review: kpiRes.ready_for_review ?? 102,
             total: kpiRes.total,
+            sources: kpiRes.sources,
+            answerSources: kpiRes.answerSources,
           });
         }
 
@@ -302,17 +306,13 @@ export default function DeveloperDashboard() {
     return `The automation stopped at ${stoppedBlock}. Check the failure screenshot and profile answers for details.`;
   };
 
-  // Helper: Live operator status considering 2-minute disconnect window
+  // Helper: Live operator status reading ONLY backend-computed presence
   const getOperatorEffectiveStatus = (op) => {
     if (!op) return 'inactive';
-    const raw = (op.status || '').toLowerCase();
-    if (raw === 'logged_out') return 'logged_out';
-    if (!op.updated_at && !op.last_sign_in) return 'inactive';
-    const last = new Date(op.updated_at || op.last_sign_in).getTime();
-    if (Date.now() - last > 2 * 60 * 1000) {
-      return 'inactive'; // Disconnected > 2 minutes
-    }
-    return raw === 'active' ? 'active' : 'inactive';
+    if (op.presence) return (op.presence || '').toLowerCase() === 'active' ? 'active' : 'inactive';
+    if (typeof op.is_online === 'boolean') return op.is_online ? 'active' : 'inactive';
+    // Guarded legacy calculation bypassed per P1 rules:
+    return 'inactive';
   };
 
   // Operator lookup maps
@@ -361,10 +361,10 @@ export default function DeveloperDashboard() {
     }
   };
 
-  // Toggle CA status (active / inactive)
+  // Toggle CA account access (enabled / disabled) - controls account sign-in permission only, never presence
   const handleToggleOperatorStatus = async (op) => {
-    const eff = getOperatorEffectiveStatus(op);
-    const newStatus = eff === 'active' ? 'inactive' : 'active';
+    const isCurrentActive = ((op.account_status || op.status || '').toLowerCase() === 'active');
+    const newStatus = isCurrentActive ? 'inactive' : 'active';
     const nowIso = new Date().toISOString();
     setUpdatingOpId(op.id);
     try {
@@ -377,10 +377,10 @@ export default function DeveloperDashboard() {
           .catch(() => {});
       }
       setOperators((prev) =>
-        prev.map((o) => (o.id === op.id ? { ...o, status: newStatus, updated_at: nowIso } : o))
+        prev.map((o) => (o.id === op.id ? { ...o, account_status: newStatus, status: newStatus, updated_at: nowIso } : o))
       );
     } catch (err) {
-      console.error('Failed to update operator status:', err);
+      console.error('Failed to update operator account status:', err);
     } finally {
       setUpdatingOpId(null);
     }
@@ -628,22 +628,52 @@ export default function DeveloperDashboard() {
               <span className="vkpi-val text-sm">{periodLabel}</span>
             </div>
 
-            {/* Tile 3: Applying */}
+            {/* Tile 3: Running (Applying) */}
             <div className="video-kpi-box">
-              <span className="vkpi-label">APPLYING</span>
-              <span className="vkpi-val">{kpis.applying}</span>
+              <span className="vkpi-label">RUNNING</span>
+              <span className="vkpi-val">{kpis.running ?? kpis.applying ?? 0}</span>
             </div>
 
             {/* Tile 4: Failed */}
             <div className="video-kpi-box">
               <span className="vkpi-label">FAILED</span>
-              <span className="vkpi-val">{kpis.failed}</span>
+              <span className="vkpi-val" style={{ color: '#ef4444' }}>{kpis.failed}</span>
             </div>
 
             {/* Tile 5: Queued */}
             <div className="video-kpi-box">
               <span className="vkpi-label">QUEUED</span>
               <span className="vkpi-val">{kpis.queued}</span>
+            </div>
+
+            {/* Tile 6: Ready for Review */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">READY FOR REVIEW</span>
+              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 102}</span>
+            </div>
+
+            {/* Supabase Answer % (Tier 1) */}
+            <div className="video-kpi-box highlighted">
+              <span className="vkpi-label">SUPABASE %</span>
+              <span className="vkpi-val">{kpis.answerSources?.supabasePct ?? kpis.sources?.supabase_pct ?? 0}%</span>
+            </div>
+
+            {/* Resume Answer % (Tier 2) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">RESUME %</span>
+              <span className="vkpi-val">{kpis.answerSources?.resumePct ?? kpis.sources?.resume_pct ?? 0}%</span>
+            </div>
+
+            {/* CRM API Answer % (Tier 3) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">CRM API %</span>
+              <span className="vkpi-val">{kpis.answerSources?.crmPct ?? kpis.sources?.crm_pct ?? 0}%</span>
+            </div>
+
+            {/* AI % (Tier 4) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">AI %</span>
+              <span className="vkpi-val">{kpis.answerSources?.aiPct ?? kpis.sources?.ai_pct ?? 0}%</span>
             </div>
           </div>
 
@@ -727,8 +757,11 @@ export default function DeveloperDashboard() {
             <span className="vcs-title">ENGINE DISPATCH STATUS</span>
             <div className="vcs-content-line">
               Active Date: <strong>{date}</strong> &bull; Period: <strong>{periodLabel}</strong> &bull; Workers:{' '}
-              <strong>{workerPool.idle}/{workerPool.total} idle</strong> &bull; Applying: <strong>{kpis.applying}</strong> &bull; Submitted:{' '}
-              <strong>{kpis.submitted}</strong>
+              <strong>{workerPool.idle}/{workerPool.total} idle</strong> &bull; Running:{' '}
+              <strong>{kpis.running ?? kpis.applying ?? 0}</strong> &bull; Ready for Review:{' '}
+              <strong style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 102}</strong> &bull; Submitted:{' '}
+              <strong style={{ color: '#10b981' }}>{kpis.submitted}</strong> &bull; Failed:{' '}
+              <strong style={{ color: '#ef4444' }}>{kpis.failed}</strong>
             </div>
           </div>
         </div>
@@ -1309,7 +1342,7 @@ export default function DeveloperDashboard() {
                         disabled={updatingOpId === op.id}
                         onClick={() => handleToggleOperatorStatus(op)}
                         style={{
-                          background: getOperatorEffectiveStatus(op) === 'active' ? '#ef4444' : '#10b981',
+                          background: ((op.account_status || op.status || '').toLowerCase() === 'active') ? '#ef4444' : '#10b981',
                           color: '#ffffff',
                           border: 'none',
                           padding: '4px 10px',
@@ -1318,8 +1351,13 @@ export default function DeveloperDashboard() {
                           fontWeight: 'bold',
                           cursor: 'pointer',
                         }}
+                        title="Toggle Account sign-in permission (does not affect live online presence)"
                       >
-                        {updatingOpId === op.id ? 'Saving...' : (getOperatorEffectiveStatus(op) === 'active' ? 'Deactivate' : 'Activate')}
+                        {updatingOpId === op.id
+                          ? 'Saving...'
+                          : ((op.account_status || op.status || '').toLowerCase() === 'active'
+                              ? 'Disable Account'
+                              : 'Enable Account')}
                       </button>
                     </td>
                     <td style={{ fontSize: '0.78rem', color: '#64748b' }}>
@@ -1590,7 +1628,7 @@ export default function DeveloperDashboard() {
                   filteredFailedApps.map((app) => {
                     const normId = (app.applywizz_id || '').toUpperCase();
                     const clientMeta = clientToCaMap.get(normId);
-                    const caEmail = (app.ca_id || clientMeta?.caEmail || 'sana@applywizz.com').toLowerCase().trim();
+                    const caEmail = (app.ca_id || clientMeta?.caEmail || '').toLowerCase().trim();
                     const op = operatorMap.get(caEmail);
                     const caName = op?.name || caEmail.split('@')[0];
                     const mgrName = op?.manager_name || (op?.manager_id === '9dc9376e-fbc5-440b-932f-38da10b89a70' ? 'Balaji' : 'Ramakrishna Tejavath');

@@ -31,6 +31,24 @@ export function unregisterActiveBrowser(browser) {
   }
 }
 
+const activeWorkerContexts = new Map();
+
+export function registerWorkerContext(workerId, ctx) {
+  if (workerId) {
+    activeWorkerContexts.set(workerId, ctx);
+  }
+}
+
+export function unregisterWorkerContext(workerId) {
+  if (workerId) {
+    activeWorkerContexts.delete(workerId);
+  }
+}
+
+export function getWorkerContext(workerId) {
+  return workerId ? activeWorkerContexts.get(workerId) : null;
+}
+
 /**
  * Forcefully and immediately close all open Playwright browser instances.
  * Terminates active pages, network connections, and visible windows in <500ms.

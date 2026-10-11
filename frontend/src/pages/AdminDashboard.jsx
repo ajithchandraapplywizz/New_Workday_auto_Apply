@@ -8,6 +8,9 @@ import {
   fetchDynamicKPIMetrics,
   fetchApplicationsDynamic,
   syncGlobalCompanyData,
+  fetchStaffAccessList,
+  authAdminAllowSetup,
+  authAdminResetMfa,
   supabase,
 } from '../services/api';
 import CAClientDetailsModal from '../components/CAClientDetailsModal';
@@ -27,6 +30,13 @@ export default function AdminDashboard() {
   const [selectedOperatorForModal, setSelectedOperatorForModal] = useState(null);
   const [selectedOperatorDetails, setSelectedOperatorDetails] = useState(null);
   const [selectedAppForDrawer, setSelectedAppForDrawer] = useState(null);
+
+  // Staff access MFA states
+  const [staffList, setStaffList] = useState([]);
+  const [staffLoading, setStaffLoading] = useState(false);
+  const [staffSearch, setStaffSearch] = useState('');
+  const [staffFeedback, setStaffFeedback] = useState(null);
+  const [staffActionInProgress, setStaffActionInProgress] = useState(null);
 
   // Real dynamic states
   const [reconciliation, setReconciliation] = useState({
@@ -52,8 +62,8 @@ export default function AdminDashboard() {
   const [isSyncingCompany, setIsSyncingCompany] = useState(false);
   const [syncToast, setSyncToast] = useState(null);
 
-  // Tabs as specified in Master Prompt section 5
-  const tabs = ['Overview', 'Managers', 'Operators', 'Guide'];
+  // Tabs as specified in Master Prompt section 5 & S5a-2 requirement 6
+  const tabs = ['Overview', 'Managers', 'Operators', 'Staff access', 'Guide'];
 
   // Load all dynamic data with real-time updates
   const loadData = React.useCallback(async (silent = false) => {
@@ -129,18 +139,19 @@ export default function AdminDashboard() {
     }
   };
 
-  // Helper: Live operator status considering 2-minute disconnect window
+  // Helper: Live operator status reading ONLY backend-computed presence
   const getOperatorEffectiveStatus = (op) => {
     if (!op) return 'inactive';
-    const raw = (op.status || '').toLowerCase();
-    if (raw === 'logged_out') return 'logged_out';
-    if (raw !== 'active') return 'inactive';
-    if (!op.updated_at && !op.last_sign_in) return 'inactive';
-    const last = new Date(op.updated_at || op.last_sign_in).getTime();
-    if (Date.now() - last > 2 * 60 * 1000) {
-      return 'inactive'; // Disconnected > 2 minutes
+    // Single source of truth: strictly backend op.presence ('active' | 'inactive')
+    if (op.presence) {
+      return String(op.presence).toLowerCase() === 'active' ? 'active' : 'inactive';
     }
-    return 'active';
+    if (typeof op.is_online === 'boolean') {
+      return op.is_online ? 'active' : 'inactive';
+    }
+    // Guarded legacy calculation bypassed per P1 rules:
+    // (Old browser fallback to account_status/status removed)
+    return 'inactive';
   };
 
   // Dynamic counts for Active / Inactive operators
@@ -254,6 +265,83 @@ export default function AdminDashboard() {
     window.addEventListener('hashchange', checkHash);
     return () => window.removeEventListener('hashchange', checkHash);
   }, [operators, managers]);
+
+  // S5a-2: Staff Access List Fetching
+  const loadStaffList = React.useCallback(async () => {
+    setStaffLoading(true);
+    try {
+      const token = localStorage.getItem('applywizz_auth_token') || '';
+      const res = await fetchStaffAccessList(token);
+      if (res && res.success && Array.isArray(res.staff)) {
+        setStaffList(res.staff);
+      }
+    } catch (err) {
+      console.error('Error fetching staff access list:', err);
+    } finally {
+      setStaffLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'Staff access') {
+      loadStaffList();
+    }
+  }, [activeTab, loadStaffList]);
+
+  const handleAllowSetup = async (email) => {
+    setStaffActionInProgress(email);
+    setStaffFeedback(null);
+    try {
+      const token = localStorage.getItem('applywizz_auth_token') || '';
+      const res = await authAdminAllowSetup({ targetEmail: email, token });
+      setStaffFeedback({
+        type: 'success',
+        text: `Setup successfully enabled for ${email}`,
+      });
+      await loadStaffList();
+    } catch (err) {
+      setStaffFeedback({
+        type: 'error',
+        text: `Failed to allow setup for ${email}: ${err.message}`,
+      });
+    } finally {
+      setStaffActionInProgress(null);
+    }
+  };
+
+  const handleResetMfa = async (email) => {
+    if (!window.confirm(`Are you sure you want to reset authenticator for ${email}? They will need to scan a new QR code upon their next login.`)) {
+      return;
+    }
+    setStaffActionInProgress(email);
+    setStaffFeedback(null);
+    try {
+      const token = localStorage.getItem('applywizz_auth_token') || '';
+      const res = await authAdminResetMfa({ targetEmail: email, token });
+      setStaffFeedback({
+        type: 'success',
+        text: `Authenticator successfully reset for ${email}. Setup window opened for 24h.`,
+      });
+      await loadStaffList();
+    } catch (err) {
+      setStaffFeedback({
+        type: 'error',
+        text: `Failed to reset authenticator for ${email}: ${err.message}`,
+      });
+    } finally {
+      setStaffActionInProgress(null);
+    }
+  };
+
+  const filteredStaff = useMemo(() => {
+    const q = staffSearch.trim().toLowerCase();
+    if (!q) return staffList;
+    return staffList.filter((s) =>
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.email || '').toLowerCase().includes(q) ||
+      (s.role || '').toLowerCase().includes(q)
+    );
+  }, [staffList, staffSearch]);
 
   return (
     <div className="dashboard-container">
@@ -409,19 +497,19 @@ export default function AdminDashboard() {
             {/* Submitted */}
             <div className="video-kpi-box">
               <span className="vkpi-label">SUBMITTED</span>
-              <span className="vkpi-val">{kpis.submitted}</span>
+              <span className="vkpi-val" style={{ color: '#10b981' }}>{kpis.submitted}</span>
             </div>
 
-            {/* Applied (Submitted) */}
+            {/* Ready For Review */}
             <div className="video-kpi-box">
-              <span className="vkpi-label">APPLIED</span>
-              <span className="vkpi-val">{kpis.submitted}</span>
+              <span className="vkpi-label">READY FOR REVIEW</span>
+              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 102}</span>
             </div>
 
-            {/* Running */}
+            {/* Running / Applying (Live) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">RUNNING</span>
-              <span className="vkpi-val">{kpis.applying}</span>
+              <span className="vkpi-val">{kpis.running ?? kpis.applying ?? 0}</span>
             </div>
 
             {/* Queued */}
@@ -433,7 +521,7 @@ export default function AdminDashboard() {
             {/* Failed */}
             <div className="video-kpi-box">
               <span className="vkpi-label">FAILED</span>
-              <span className="vkpi-val">{kpis.failed}</span>
+              <span className="vkpi-val" style={{ color: '#ef4444' }}>{kpis.failed}</span>
             </div>
 
             {/* Zoho Gateway Integration Status */}
@@ -448,22 +536,28 @@ export default function AdminDashboard() {
               </span>
             </div>
 
-            {/* Supabase Answer % */}
+            {/* Supabase Answer % (Tier 1) */}
             <div className="video-kpi-box highlighted">
               <span className="vkpi-label">SUPABASE %</span>
-              <span className="vkpi-val">{kpis.answerSources.supabasePct}%</span>
+              <span className="vkpi-val">{kpis.answerSources?.supabasePct ?? 0}%</span>
             </div>
 
-            {/* AI Answer % */}
-            <div className="video-kpi-box">
-              <span className="vkpi-label">AI %</span>
-              <span className="vkpi-val">{kpis.answerSources.aiPct}%</span>
-            </div>
-
-            {/* Resume Answer % */}
+            {/* Resume Answer % (Tier 2) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">RESUME %</span>
-              <span className="vkpi-val">{kpis.answerSources.resumePct}%</span>
+              <span className="vkpi-val">{kpis.answerSources?.resumePct ?? 0}%</span>
+            </div>
+
+            {/* CRM API Answer % (Tier 3) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">CRM API %</span>
+              <span className="vkpi-val">{kpis.answerSources?.crmPct ?? 0}%</span>
+            </div>
+
+            {/* AI Answer % (Tier 4) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">AI %</span>
+              <span className="vkpi-val">{kpis.answerSources?.aiPct ?? 0}%</span>
             </div>
           </div>
 
@@ -496,7 +590,7 @@ export default function AdminDashboard() {
               <tbody>
                 {managers.map((mgr) => {
                   const mgrOps = operators.filter((o) => o.manager_id === mgr.id);
-                  const activeCount = mgrOps.filter((o) => (o.status || 'inactive').toLowerCase() === 'active').length;
+                  const activeCount = mgrOps.filter((o) => getOperatorEffectiveStatus(o) === 'active').length;
                   const inactiveCount = mgrOps.length - activeCount;
                   const mgrApps = applications.filter((a) => a.manager_id === mgr.id).length;
 
@@ -618,6 +712,204 @@ export default function AdminDashboard() {
                   <tr>
                     <td colSpan={5} style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
                       No operators found matching the criteria.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* 4. STAFF ACCESS TAB — Microsoft Authenticator MFA Enrollment & Setup */}
+      {activeTab === 'Staff access' && (
+        <div className="tab-body-fade">
+          <div className="video-card-section" style={{ marginBottom: '1.25rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+              <div>
+                <span className="vcs-title">STAFF AUTHENTICATOR & ACCESS CONTROL</span>
+                <p style={{ color: '#94a3b8', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+                  Manage Microsoft Authenticator enrollment, grant setup permissions for new staff, and reset lost authenticators.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={loadStaffList}
+                disabled={staffLoading}
+                style={{
+                  background: 'rgba(59, 130, 246, 0.15)',
+                  border: '1px solid rgba(59, 130, 246, 0.4)',
+                  color: '#60a5fa',
+                  padding: '6px 14px',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: '0.85rem',
+                }}
+              >
+                {staffLoading ? 'Refreshing...' : '↻ Refresh List'}
+              </button>
+            </div>
+
+            {staffFeedback && (
+              <div
+                style={{
+                  marginTop: '1rem',
+                  padding: '0.75rem 1rem',
+                  borderRadius: '6px',
+                  background: staffFeedback.type === 'success' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+                  border: `1px solid ${staffFeedback.type === 'success' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                  color: staffFeedback.type === 'success' ? '#34d399' : '#f87171',
+                  fontSize: '0.875rem',
+                }}
+              >
+                {staffFeedback.text}
+              </div>
+            )}
+          </div>
+
+          <div className="video-filter-bar" style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
+            <input
+              type="text"
+              value={staffSearch}
+              onChange={(e) => setStaffSearch(e.target.value)}
+              placeholder="Search staff by name, email, or role..."
+              className="video-input-search"
+              style={{ maxWidth: '400px' }}
+            />
+            <span style={{ alignSelf: 'center', fontSize: '0.85rem', color: '#94a3b8' }}>
+              Showing {filteredStaff.length} of {staffList.length} staff accounts
+            </span>
+          </div>
+
+          <div className="video-table-container">
+            <table className="video-data-table">
+              <thead>
+                <tr>
+                  <th>STAFF MEMBER</th>
+                  <th>ROLE</th>
+                  <th>ENROLLED</th>
+                  <th>SETUP ALLOWED</th>
+                  <th>LAST SEEN</th>
+                  <th>ACTIONS</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredStaff.length > 0 ? (
+                  filteredStaff.map((member) => {
+                    const isEnrolled = Boolean(member.mfa_enrolled);
+                    const isSetupAllowed = Boolean(member.setup_allowed);
+                    const isWorking = staffActionInProgress === member.email;
+
+                    return (
+                      <tr key={member.id || member.email}>
+                        <td>
+                          <div>
+                            <strong>{member.name || 'Staff User'}</strong>
+                            <div style={{ color: '#94a3b8', fontSize: '0.8rem' }}>{member.email}</div>
+                          </div>
+                        </td>
+                        <td>
+                          <span
+                            style={{
+                              textTransform: 'uppercase',
+                              fontWeight: 700,
+                              fontSize: '0.75rem',
+                              padding: '2px 8px',
+                              borderRadius: '4px',
+                              background:
+                                member.role === 'admin'
+                                  ? 'rgba(239, 68, 68, 0.2)'
+                                  : member.role === 'developer'
+                                  ? 'rgba(168, 85, 247, 0.2)'
+                                  : member.role === 'manager'
+                                  ? 'rgba(59, 130, 246, 0.2)'
+                                  : 'rgba(100, 116, 139, 0.2)',
+                              color:
+                                member.role === 'admin'
+                                  ? '#f87171'
+                                  : member.role === 'developer'
+                                  ? '#c084fc'
+                                  : member.role === 'manager'
+                                  ? '#60a5fa'
+                                  : '#cbd5e1',
+                            }}
+                          >
+                            {member.role || 'staff'}
+                          </span>
+                        </td>
+                        <td>
+                          <span
+                            className={`video-status-tag ${isEnrolled ? 'active' : 'inactive'}`}
+                            style={{
+                              background: isEnrolled ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+                              color: isEnrolled ? '#34d399' : '#f87171',
+                              border: `1px solid ${isEnrolled ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                            }}
+                          >
+                            {isEnrolled ? 'YES' : 'NO'}
+                          </span>
+                        </td>
+                        <td>
+                          <span
+                            className={`video-status-tag ${isSetupAllowed ? 'active' : 'inactive'}`}
+                            style={{
+                              background: isSetupAllowed ? 'rgba(59, 130, 246, 0.15)' : 'rgba(100, 116, 139, 0.15)',
+                              color: isSetupAllowed ? '#60a5fa' : '#94a3b8',
+                              border: `1px solid ${isSetupAllowed ? 'rgba(59, 130, 246, 0.3)' : 'rgba(100, 116, 139, 0.3)'}`,
+                            }}
+                          >
+                            {isSetupAllowed ? 'YES' : 'NO'}
+                          </span>
+                        </td>
+                        <td style={{ color: '#94a3b8', fontSize: '0.8rem' }}>
+                          {member.last_seen_at ? new Date(member.last_seen_at).toLocaleTimeString() : '—'}
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            <button
+                              type="button"
+                              onClick={() => handleAllowSetup(member.email)}
+                              disabled={isWorking}
+                              style={{
+                                padding: '5px 10px',
+                                borderRadius: '5px',
+                                border: '1px solid #3b82f6',
+                                background: 'rgba(59, 130, 246, 0.15)',
+                                color: '#60a5fa',
+                                fontWeight: 600,
+                                fontSize: '0.75rem',
+                                cursor: isWorking ? 'wait' : 'pointer',
+                              }}
+                            >
+                              Allow setup
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleResetMfa(member.email)}
+                              disabled={isWorking}
+                              style={{
+                                padding: '5px 10px',
+                                borderRadius: '5px',
+                                border: '1px solid #ef4444',
+                                background: 'rgba(239, 68, 68, 0.15)',
+                                color: '#f87171',
+                                fontWeight: 600,
+                                fontSize: '0.75rem',
+                                cursor: isWorking ? 'wait' : 'pointer',
+                              }}
+                            >
+                              Reset authenticator
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                ) : (
+                  <tr>
+                    <td colSpan={6} style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
+                      {staffLoading ? 'Loading staff access list...' : 'No staff accounts found.'}
                     </td>
                   </tr>
                 )}

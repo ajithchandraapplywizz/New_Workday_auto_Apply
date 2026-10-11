@@ -35,6 +35,21 @@ export default defineConfig({
         changeOrigin: true,
         configure: handleProxyError,
       },
+      '/api/auth': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/operators': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/admin': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
     },
   },
   preview: {
@@ -53,6 +68,21 @@ export default defineConfig({
         configure: handleProxyError,
       },
       '/api/submissions': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/auth': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/operators': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/admin': {
         target: backendUrl,
         changeOrigin: true,
         configure: handleProxyError,

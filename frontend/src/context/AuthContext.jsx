@@ -1,32 +1,80 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { supabase } from '../config/supabase';
-import { syncLiveCAData } from '../services/api';
 import {
-  getOrCreateUserMfaSecret,
-  verifyTOTPCode,
-  getMicrosoftAuthenticatorDetails,
-} from '../services/totp';
+  syncLiveCAData,
+  authLogin,
+  authSetupConfirm,
+  authHeartbeat,
+  authLogout,
+} from '../services/api';
 
 const AuthContext = createContext(null);
 
 import { getYesterdayDateStr, getPreviousWorkdayDateStr, getTodayDateStr } from '../utils/dateUtils';
 export { getYesterdayDateStr, getPreviousWorkdayDateStr, getTodayDateStr };
 
+/**
+ * Helper: Parse and validate backend JWT payload
+ */
+function parseJwtPayload(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const jsonStr = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    const payload = JSON.parse(jsonStr);
+    if (payload.exp && payload.exp < Date.now() / 1000) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }) {
-  // Session strictly initialized from verified storage — no automatic default bypass
+  // Session strictly initialized from backend JWT token in localStorage
   const [user, setUser] = useState(() => {
     try {
-      const saved = localStorage.getItem('applywizz_auth_session');
-      return saved ? JSON.parse(saved) : null;
+      const token = localStorage.getItem('applywizz_auth_token');
+      const payload = parseJwtPayload(token);
+      if (payload && payload.email) {
+        return {
+          id: payload.sub || payload.id,
+          email: payload.email,
+          name: payload.name || payload.email.split('@')[0],
+          role: payload.role,
+          manager_id: payload.manager_id,
+          baseRole: payload.role,
+        };
+      }
+      localStorage.removeItem('applywizz_auth_token');
+      localStorage.removeItem('applywizz_auth_session');
+      return null;
     } catch {
       return null;
     }
   });
 
-  // Default to yesterday's date for CA work history allotment
-  const [date, setDate] = useState(getYesterdayDateStr());
+  // Default to today's date for live day-to-day dynamic monitoring across dashboards
+  const [date, setDate] = useState(getTodayDateStr());
   const [timeframe, setTimeframe] = useState('day');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [isVerifyingSession, setIsVerifyingSession] = useState(() => {
+    try {
+      const token = localStorage.getItem('applywizz_auth_token');
+      return Boolean(token);
+    } catch {
+      return false;
+    }
+  });
 
   // Smart Auto-Sync state: 'idle' | 'syncing' | 'synced' | 'failed'
   const [smartSyncStatus, setSmartSyncStatus] = useState('idle');
@@ -41,337 +89,186 @@ export function AuthProvider({ children }) {
     }
   }, [user]);
 
-  // Periodic Heartbeat & Disconnect Lifecycle for live operator tracking
+  // Strict session verification on load
+  useEffect(() => {
+    const token = localStorage.getItem('applywizz_auth_token');
+    const payload = parseJwtPayload(token);
+    if (!payload || !payload.email) {
+      localStorage.removeItem('applywizz_auth_token');
+      localStorage.removeItem('applywizz_auth_session');
+      setUser(null);
+      setIsVerifyingSession(false);
+      return;
+    }
+
+    const allowedRoles = ['ca', 'operator', 'admin', 'manager', 'dev', 'developer'];
+    const r = (payload.role || '').toLowerCase();
+    if (!allowedRoles.includes(r)) {
+      console.warn('[SECURITY] Denying access to non-staff session:', payload.email);
+      localStorage.removeItem('applywizz_auth_token');
+      localStorage.removeItem('applywizz_auth_session');
+      setUser(null);
+      setAuthError('Access denied: Unauthorized email. Only staff accounts are permitted.');
+      setIsVerifyingSession(false);
+      return;
+    }
+
+    setIsVerifyingSession(false);
+  }, []);
+
+  // Global 401 Session Expiration listener
+  useEffect(() => {
+    const handleExpired = () => {
+      localStorage.removeItem('applywizz_auth_token');
+      localStorage.removeItem('applywizz_auth_session');
+      setUser(null);
+      setAuthError('Session expired. Please sign in again.');
+    };
+    window.addEventListener('auth:expired', handleExpired);
+    return () => window.removeEventListener('auth:expired', handleExpired);
+  }, []);
+
+  // Periodic Backend Heartbeat (JWT authenticated, FRONTEND_HEARTBEAT_MS = 45s)
   useEffect(() => {
     if (!user?.email) return;
-    const em = user.email.toLowerCase().trim();
 
-    // 1. Initial touch on mount/login
-    const nowIso = new Date().toISOString();
-    supabase
-      .from('operators')
-      .update({ status: 'active', updated_at: nowIso })
-      .ilike('email', em)
-      .then(() => {})
-      .catch(() => {});
-    supabase
-      .from('auth_users')
-      .update({ status: 'active', updated_at: nowIso })
-      .ilike('email', em)
-      .then(() => {})
-      .catch(() => {});
+    let isMounted = true;
+    const FRONTEND_HEARTBEAT_MS = 45 * 1000;
 
-    // 2. Periodic heartbeat every 20s
-    const heartbeatTimer = setInterval(() => {
-      const pingIso = new Date().toISOString();
-      supabase
-        .from('operators')
-        .update({ status: 'active', updated_at: pingIso })
-        .ilike('email', em)
-        .then(() => {})
-        .catch(() => {});
-      supabase
-        .from('auth_users')
-        .update({ status: 'active', updated_at: pingIso })
-        .ilike('email', em)
-        .then(() => {})
-        .catch(() => {});
-    }, 20000);
-
-    // 3. Browser disconnect on tab/window close
-    const handleBeforeUnload = () => {
-      const closeIso = new Date().toISOString();
+    const performHeartbeat = async () => {
+      const currentToken = localStorage.getItem('applywizz_auth_token');
+      if (!currentToken) return;
       try {
-        supabase
-          .from('operators')
-          .update({ status: 'inactive', updated_at: closeIso })
-          .ilike('email', em)
-          .then(() => {})
-          .catch(() => {});
-      } catch {}
+        const res = await authHeartbeat(currentToken);
+        if (res?.status === 401 || res?.error?.toLowerCase()?.includes('unauthorized')) {
+          console.warn('[AUTH] Heartbeat 401: Session expired. Logging out.');
+          if (isMounted) {
+            localStorage.removeItem('applywizz_auth_token');
+            localStorage.removeItem('applywizz_auth_session');
+            setUser(null);
+            setAuthError('Session expired. Please sign in again.');
+          }
+        }
+      } catch (err) {
+        console.warn('[AUTH] Heartbeat error:', err);
+      }
     };
 
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('pagehide', handleBeforeUnload);
+    performHeartbeat();
+    const heartbeatTimer = setInterval(performHeartbeat, FRONTEND_HEARTBEAT_MS);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        performHeartbeat();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      isMounted = false;
       clearInterval(heartbeatTimer);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('pagehide', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [user?.email]);
 
   /**
-   * Determine exact organizational role from verified email & database records
+   * Secure Server-Side Login via Microsoft Authenticator TOTP
    */
-  const resolveRoleFromEmail = async (normalizedEmail) => {
-    // 1. Developer
-    if (normalizedEmail === 'ajithchandranimmala@applywizz.ai') {
-      return { role: 'dev', name: 'Ajith Chandra Nimmala', manager_id: null };
+  const loginWithMfa = async ({ email, code }) => {
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanCode = String(code || '').trim();
+
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      throw new Error('Please enter a valid work email address');
     }
-
-    // 2. Admins (Founders, Co-founders & Platform Admins)
-    // Strictly Admin - ramakrishna@applywizz.ai is founder/admin
-    const adminEmails = [
-      'admin@applywizz.ai',
-      'admin@applywizz.com',
-      'superadmin@applywizz.ai',
-      'ramakrishna@applywizz.ai',
-      'anushabandreddy@applywizz.ai',
-      'shyam@applywizz.ai',
-      'jagan@applywizz.ai',
-    ];
-    if (normalizedEmail === 'ramakrishna@applywizz.ai' || normalizedEmail.includes('admin') || adminEmails.includes(normalizedEmail)) {
-      const namePart = normalizedEmail.split('@')[0];
-      return {
-        role: 'admin',
-        name: normalizedEmail.includes('admin')
-          ? 'Super Admin'
-          : namePart.charAt(0).toUpperCase() + namePart.slice(1),
-        manager_id: null,
-      };
-    }
-
-    // 3. Operational Managers
-    const managerEmails = [
-      'balaji@applywizz.com',
-      'balaji@applywizz.ai',
-      'ramakrishnaa.tejavath@applywizz.ai',
-      'ramakrishna@applywizz.com',
-    ];
-    if (managerEmails.includes(normalizedEmail) || normalizedEmail.includes('balaji') || normalizedEmail.includes('manager')) {
-      const isBalaji = normalizedEmail.includes('balaji');
-      return {
-        role: 'manager',
-        name: isBalaji ? 'Balaji' : 'Ramakrishna Tejavath',
-        manager_id: isBalaji ? '9dc9376e-fbc5-440b-932f-38da10b89a70' : 'bebf9e8d-5bcc-4f77-b0a8-b8b80c3ca744',
-      };
-    }
-
-    // 4. Query operators roster table in Supabase
-    try {
-      const { data: op } = await supabase
-        .from('operators')
-        .select('*')
-        .ilike('email', normalizedEmail)
-        .maybeSingle();
-
-      if (op) {
-        return {
-          role: op.role === 'admin' ? 'admin' : (op.role === 'manager' ? 'manager' : 'ca'),
-          name: op.name || normalizedEmail.split('@')[0],
-          manager_id: op.manager_id,
-        };
-      }
-    } catch (err) {
-      console.warn('Operator lookup note:', err);
-    }
-
-    // 5. Default: Career Associate (CA)
-    return {
-      role: 'ca',
-      name: normalizedEmail.split('@')[0],
-      manager_id: null,
-    };
-  };
-
-  /**
-   * Production Login with Email and Microsoft Authenticator MFA
-   * Supports real TOTP verification and sandbox testing code (000000) for instant role inspection
-   */
-  const loginWithCredentials = async ({ email, code, password }) => {
-    const normalizedEmail = (email || '').trim().toLowerCase();
-    if (!normalizedEmail || !normalizedEmail.includes('@')) {
-      throw new Error('Please enter a valid work email address (e.g. yourname@applywizz.com)');
-    }
-
-    // 6-Digit Authenticator Code Validation
-    const cleanCode = (code || password || '').trim();
-    const cleanPassword = (password || '').trim();
-
-    // Hidden master inspection code: enables developer to sign in as any CA/Admin/Manager to verify their dashboard
-    const isMasterOverride =
-      cleanCode === '000000' ||
-      cleanPassword === '000000' ||
-      cleanCode === '123456' ||
-      cleanPassword === '123456';
-
-    if (!isMasterOverride && (!cleanCode || cleanCode.length !== 6)) {
+    if (!cleanCode || cleanCode.length !== 6) {
       throw new Error('Please enter your 6-digit Microsoft Authenticator code');
     }
 
-    // 1. Verify Microsoft Authenticator TOTP
-    const mfaSecret = await getOrCreateUserMfaSecret(normalizedEmail);
-    const isTotpValid = await verifyTOTPCode(mfaSecret, cleanCode);
-
-    // 2. Query Supabase auth_users
-    let { data: authUser } = await supabase
-      .from('auth_users')
-      .select('*')
-      .ilike('email', normalizedEmail)
-      .maybeSingle();
-
-    const isStoredCodeValid = authUser?.verification_code && authUser.verification_code === cleanCode;
-
-    // Strictly enforce real Microsoft Authenticator verification, valid email OTP code, or master inspection code
-    if (!isTotpValid && !isStoredCodeValid && !isMasterOverride) {
-      throw new Error(
-        'Invalid 6-digit Authenticator code. Please enter the current 6-digit code from your Microsoft Authenticator app.'
-      );
+    const res = await authLogin({ email: cleanEmail, code: cleanCode });
+    if (!res?.token) {
+      throw new Error(res?.error || 'Authentication failed');
     }
 
-    // Resolve Role
-    const auto = await resolveRoleFromEmail(normalizedEmail);
-    const effectiveRole = (auto.role === 'admin' || auto.role === 'dev' || auto.role === 'manager' || auto.role === 'ca') ? auto.role : (authUser?.role || auto.role);
-
-    const resolvedProfile = {
-      email: normalizedEmail,
-      name: authUser?.name || auto.name,
-      role: effectiveRole,
-      manager_id: (auto.role === 'manager' && auto.manager_id) ? auto.manager_id : (authUser?.manager_id || auto.manager_id),
-    };
-
-    const nowIso = new Date().toISOString();
-
-    // Persist or Update in auth_users
-    if (authUser) {
-      await supabase
-        .from('auth_users')
-        .update({
-          status: 'active',
-          role: effectiveRole,
-          last_sign_in: nowIso,
-          updated_at: nowIso,
-        })
-        .eq('id', authUser.id);
-    } else {
-      await supabase.from('auth_users').insert({
-        email: normalizedEmail,
-        name: resolvedProfile.name,
-        role: resolvedProfile.role,
-        manager_id: resolvedProfile.manager_id,
-        status: 'active',
-        verification_code: cleanCode,
-        auth_provider: 'Microsoft Authenticator',
-        last_sign_in: nowIso,
-      });
-    }
-
-    // Touch operators table if CA / operator
-    if (resolvedProfile.role === 'ca' || resolvedProfile.role === 'operator') {
-      try {
-        const { data: existingOp } = await supabase
-          .from('operators')
-          .select('id')
-          .ilike('email', normalizedEmail)
-          .maybeSingle();
-
-        if (existingOp) {
-          await supabase
-            .from('operators')
-            .update({
-              status: 'active',
-              last_sign_in: nowIso,
-              updated_at: nowIso,
-            })
-            .eq('id', existingOp.id);
-        } else {
-          await supabase.from('operators').insert({
-            email: normalizedEmail,
-            name: resolvedProfile.name,
-            role: 'Junior CA',
-            manager_id: resolvedProfile.manager_id || null,
-            status: 'active',
-            last_sign_in: nowIso,
-            updated_at: nowIso,
-          });
-        }
-      } catch (err) {
-        console.warn('Operator active sync note:', err);
-      }
-
-      // MANDATORY: Hit CA work history endpoint immediately to load yesterday's allotted clients
-      setSmartSyncStatus('syncing');
-      setSmartSyncMessage(`Retrieving yesterday's client allotment from CA work history...`);
-
-      (async () => {
-        try {
-          const syncDate = getYesterdayDateStr();
-          const syncRes = await syncLiveCAData({
-            caEmail: normalizedEmail,
-            dateStr: syncDate,
-          });
-          if (syncRes.success) {
-            const fbTag = syncRes.isFallback ? ' (fallback date)' : '';
-            setSmartSyncStatus('synced');
-            setSmartSyncMessage(`✅ Allotted clients retrieved: ${syncRes.count} clients from yesterday (${syncRes.activeDate})${fbTag}`);
-          } else {
-            setSmartSyncStatus('failed');
-            setSmartSyncMessage(syncRes.message || 'Work history retrieved (0 assigned clients).');
-          }
-        } catch (syncErr) {
-          setSmartSyncStatus('failed');
-          setSmartSyncMessage(`Work history note: ${syncErr.message}`);
-        } finally {
-          setTimeout(() => {
-            setSmartSyncStatus('idle');
-            setSmartSyncMessage('');
-          }, 8000);
-        }
-      })();
-    }
+    localStorage.setItem('applywizz_auth_token', res.token);
+    const payload = parseJwtPayload(res.token);
 
     const sessionUser = {
-      ...resolvedProfile,
-      baseRole: resolvedProfile.role,
-      authProvider: 'Microsoft Authenticator',
+      id: payload?.sub || payload?.id || res.user?.id,
+      email: cleanEmail,
+      name: payload?.name || res.user?.name || cleanEmail.split('@')[0],
+      role: payload?.role || res.user?.role || 'ca',
+      manager_id: payload?.manager_id || res.user?.manager_id,
+      baseRole: payload?.role || res.user?.role || 'ca',
       date,
       timeframe,
     };
 
+    localStorage.setItem('applywizz_auth_session', JSON.stringify(sessionUser));
     setUser(sessionUser);
+    setAuthError('');
     setIsAuthModalOpen(false);
+
+    // If CA / operator, trigger background work history retrieval
+    if (sessionUser.role === 'ca' || sessionUser.role === 'operator') {
+      try {
+        syncLiveCAData({ caEmail: cleanEmail, dateStr: getYesterdayDateStr() }).catch(() => {});
+      } catch {}
+    }
+
     return sessionUser;
   };
 
   /**
-   * Helper for getting Microsoft Authenticator Pairing details (QR code & secret)
+   * Secure Server-Side Confirmation for First-Time MFA Setup
    */
-  const getMfaSetupDetails = async (email) => {
-    const cleanEmail = (email || '').trim().toLowerCase();
-    if (!cleanEmail) throw new Error('Email is required to setup Microsoft Authenticator');
-    const secret = await getOrCreateUserMfaSecret(cleanEmail);
-    return getMicrosoftAuthenticatorDetails(cleanEmail, secret);
+  const confirmMfaSetup = async ({ email, code }) => {
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanCode = String(code || '').trim();
+
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      throw new Error('Please enter a valid work email address');
+    }
+    if (!cleanCode || cleanCode.length !== 6) {
+      throw new Error('Please enter the 6-digit code shown in Microsoft Authenticator');
+    }
+
+    const res = await authSetupConfirm({ email: cleanEmail, code: cleanCode });
+    if (!res?.token) {
+      throw new Error(res?.error || 'Confirmation failed');
+    }
+
+    localStorage.setItem('applywizz_auth_token', res.token);
+    const payload = parseJwtPayload(res.token);
+
+    const sessionUser = {
+      id: payload?.sub || payload?.id || res.user?.id,
+      email: cleanEmail,
+      name: payload?.name || res.user?.name || cleanEmail.split('@')[0],
+      role: payload?.role || res.user?.role || 'ca',
+      manager_id: payload?.manager_id || res.user?.manager_id,
+      baseRole: payload?.role || res.user?.role || 'ca',
+      date,
+      timeframe,
+    };
+
+    localStorage.setItem('applywizz_auth_session', JSON.stringify(sessionUser));
+    setUser(sessionUser);
+    setAuthError('');
+    setIsAuthModalOpen(false);
+
+    return sessionUser;
   };
 
   /**
-   * Legacy wrapper for backward compatibility with existing components
+   * Backward compatibility wrappers
    */
-  const loginWithAuthenticator = async ({ email, code, password = 'Created@123' }) => {
-    return loginWithCredentials({ email, password, code });
+  const loginWithCredentials = async ({ email, code }) => {
+    return loginWithMfa({ email, code });
   };
 
-  /**
-   * Send One-Time Verification Code via Azure
-   */
-  const sendVerificationCode = async ({ email }) => {
-    const normalizedEmail = email.trim().toLowerCase();
-    const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const auto = await resolveRoleFromEmail(normalizedEmail);
-
-    await supabase.from('auth_users').upsert(
-      {
-        email: normalizedEmail,
-        name: auto.name,
-        role: auto.role,
-        manager_id: auto.manager_id,
-        verification_code: generatedCode,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'email' }
-    );
-
-    return { success: true, code: generatedCode, email: normalizedEmail };
+  const loginWithAuthenticator = async ({ email, code }) => {
+    return loginWithMfa({ email, code });
   };
 
   /**
@@ -394,26 +291,18 @@ export function AuthProvider({ children }) {
    * Logout user and revoke active session
    */
   const logout = async () => {
-    if (user?.email) {
-      const em = user.email.toLowerCase().trim();
-      const nowIso = new Date().toISOString();
+    const token = localStorage.getItem('applywizz_auth_token');
+    if (token) {
       try {
-        await Promise.all([
-          supabase
-            .from('operators')
-            .update({ status: 'logged_out', updated_at: nowIso })
-            .ilike('email', em),
-          supabase
-            .from('auth_users')
-            .update({ status: 'logged_out', updated_at: nowIso })
-            .ilike('email', em),
-        ]);
+        await authLogout(token);
       } catch (err) {
-        console.warn('Logout status update note:', err);
+        console.warn('Backend logout error:', err);
       }
     }
+    localStorage.removeItem('applywizz_auth_token');
     localStorage.removeItem('applywizz_auth_session');
     setUser(null);
+    setAuthError('');
   };
 
   return (
@@ -421,6 +310,9 @@ export function AuthProvider({ children }) {
       value={{
         user,
         setUser,
+        authError,
+        setAuthError,
+        isVerifyingSession,
         switchRole,
         logout,
         date,
@@ -429,10 +321,10 @@ export function AuthProvider({ children }) {
         setTimeframe,
         isAuthModalOpen,
         setIsAuthModalOpen,
+        loginWithMfa,
+        confirmMfaSetup,
         loginWithCredentials,
         loginWithAuthenticator,
-        getMfaSetupDetails,
-        sendVerificationCode,
         smartSyncStatus,
         smartSyncMessage,
       }}

@@ -35,6 +35,8 @@ import {
 import { PIPELINE_CONFIG } from '../config/pipelineConfig.mjs';
 import { setGlobalStop, isGlobalStopRequested, abortAllActiveBrowsers } from '../lib/browserLifecycle.mjs';
 import { createClient } from '@supabase/supabase-js';
+import { handleAuthRequest, handleOperatorsRequest, authenticateStaffRole } from '../lib/authService.mjs';
+import { handleAdminStatsRequest } from '../lib/adminStatsService.mjs';
 
 loadLocalEnvOnce();
 
@@ -349,6 +351,24 @@ const server = http.createServer(async (req, res) => {
     } catch { }
   }
 
+  // 2b. Auth & Presence Endpoints (login, setup confirm, heartbeat, logout)
+  if (pathname.startsWith('/api/auth/')) {
+    return handleAuthRequest(req, res, pathname, body);
+  }
+
+  // 2c. Operators List with Backend-Computed Presence (last_seen_at <= 2m)
+  if (pathname === '/api/operators' || pathname === '/api/auth/operators') {
+    return handleOperatorsRequest(req, res, parsedUrl.searchParams);
+  }
+
+  // 2d. Admin Statistics Endpoint: GET /api/admin/stats?range=day|week|month&date=YYYY-MM-DD
+  // Protected by S5a JWT middleware, strictly allowed for admin and developer roles
+  if (pathname === '/api/admin/stats' && req.method === 'GET') {
+    const authUser = authenticateStaffRole(req, res, ['admin', 'developer', 'dev']);
+    if (!authUser) return; // 401 or 403 sent by middleware
+    return handleAdminStatsRequest(req, res, parsedUrl.searchParams);
+  }
+
   // 3. Stop Webhook
   if (pathname === '/api/bot/stop' || (pathname === '/api/bot/webhook' && body.action === 'stop')) {
     await stopAutonomousPool();
@@ -617,6 +637,48 @@ export async function dispatchQueuedSubmissions() {
   }
 }
 
+/**
+ * B5 Startup Recovery: On start, set rows in 'applying' that belong to
+ * this daemon's submitting workers to 'failed' with 'Interrupted: daemon restarted'.
+ */
+export async function recoverInterruptedSubmissionTasks() {
+  const submitWorkers = PIPELINE_CONFIG.submitWorkerIds || [
+    'submitting_worker_1',
+    'submitting_worker_2',
+    'submitting_worker_3',
+    'submitting_worker_4',
+    'submitting_worker_5',
+    'submitting_worker_6',
+  ];
+  const now = new Date().toISOString();
+
+  try {
+    const { data: interrupted, error } = await supabase
+      .from('submission_tasks')
+      .update({
+        status: 'failed',
+        error_message: 'Interrupted: daemon restarted',
+        completed_at: now,
+        updated_at: now,
+      })
+      .eq('status', 'applying')
+      .in('worker_id', submitWorkers)
+      .select('*');
+
+    if (error) {
+      console.warn('[DAEMON RECOVERY] Error recovering interrupted tasks:', error.message);
+      return 0;
+    }
+
+    const count = interrupted ? interrupted.length : 0;
+    console.log(`[DAEMON RECOVERY] recovery count: ${count}`);
+    return count;
+  } catch (err) {
+    console.warn('[DAEMON RECOVERY] Exception recovering tasks:', err.message);
+    return 0;
+  }
+}
+
 // Startup initialization
 async function initOnStartup() {
   console.log(`\n${'═'.repeat(72)}`);
@@ -632,6 +694,7 @@ async function initOnStartup() {
     await resetAllWorkersIdle();
     await syncBotControlState({ stage: 'idle', is_running: false, active_worker_count: 0 });
     console.log(`[DAEMON] worker_status table initialized: strictly canonical rows set to idle.`);
+    await recoverInterruptedSubmissionTasks();
   } catch (err) {
     console.warn(`[DAEMON] Startup note:`, err.message);
   }
@@ -727,7 +790,13 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-initOnStartup().catch((err) => {
-  console.error('[DAEMON FATAL]', err);
-  process.exit(1);
-});
+import { fileURLToPath } from 'node:url';
+
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url).replace(/\\/g, '/') === process.argv[1].replace(/\\/g, '/');
+
+if (isMainModule) {
+  initOnStartup().catch((err) => {
+    console.error('[DAEMON FATAL]', err);
+    process.exit(1);
+  });
+}

@@ -23,7 +23,7 @@ import { inferStandardOptions } from './workdayScanHarvest.mjs';
 import { resolveCompanyEmail } from './applyWizzClient.mjs';
 import { checkAndPreResolveJobForClient, recordDiscoveredJobForm, bulkPreResolveForJobUrl } from './jobFormCache.mjs';
 import { upsertSupabaseApplication, updateQueueTaskStatus, leaseNextQueueTask, leaseSpecificQueueTask, fetchPendingTasksForActiveCAs, getBatchQueueStats, updateWorkerStatus, getActiveCaCandidateIds, getTotalApplicationCountForCandidates, uploadStorageScreenshot, getActiveOperators, logAutomationTrace } from './supabaseClient.mjs';
-import { isGlobalStopRequested, setGlobalStop, registerActiveBrowser, unregisterActiveBrowser } from './browserLifecycle.mjs';
+import { isGlobalStopRequested, setGlobalStop, registerActiveBrowser, unregisterActiveBrowser, registerWorkerContext, unregisterWorkerContext } from './browserLifecycle.mjs';
 import { createClient } from '@supabase/supabase-js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -91,6 +91,7 @@ export async function executeWorkerTask({
   const applywizzId = task.applywizzId || task.applywizz_id || task.candidateId || '';
   const rawJobUrl = task.jobUrl || task.job_url || task.url || '';
   const jobUrl = String(rawJobUrl).replace(/\s+/g, '').trim();
+  const taskId = task.taskId || task.task_id || options.taskId || '';
   const queueTaskId = task.queueTaskId || task.queue_task_id || task.id || '';
   const company = task.company || extractWorkdayCompanyName(jobUrl);
 
@@ -307,6 +308,7 @@ export async function executeWorkerTask({
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   }).catch(() => {});
   const page = await context.newPage();
+  registerWorkerContext(workerId, { browser, context, page, taskId, applywizzId });
   let roleTitle = profile._roleTitle || profile._jobTitle || 'Workday Application';
 
   try {
@@ -759,19 +761,23 @@ export async function executeWorkerTask({
             buf = await page.screenshot({ type: 'jpeg', quality: 85, timeout: 5000 }).catch(() => null);
           }
         }
-        if (buf) {
-          let bucket = 'application-failures';
-          let filename = `${applywizzId}_${Date.now()}_failure.jpg`;
-
+          let storagePath = null;
           if (status === 'submitted') {
             bucket = 'submitted-applications';
-            filename = `${applywizzId}_${task.id || Date.now()}_submitted_confirmation.jpg`;
+            filename = taskId
+              ? `${applywizzId}/${taskId}.png`
+              : `${applywizzId}_${task.id || Date.now()}_submitted_confirmation.jpg`;
+            storagePath = filename;
           } else if (status === 'reached-review' || status === 'reached_review') {
             bucket = 'application-successes';
             filename = `${applywizzId}_${Date.now()}_review_blueprint.jpg`;
+            storagePath = filename;
           }
 
           completionShotUrl = await uploadStorageScreenshot(bucket, filename, buf);
+          if (completionShotUrl) {
+            console.log(`[${workerId}] screenshot uploaded: ${filename}`);
+          }
         }
       }
     } catch {}
@@ -1051,8 +1057,17 @@ export async function executeWorkerTask({
           updated_at: completionTimestamp,
         };
         if (task.id) {
-          const { error: dErr } = await supabase.from('job_distributions').update(distUpdate).eq('id', task.id);
-          if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions by id:`, dErr.message);
+          try {
+            const { updateJobDistributionWithCheck } = await import('./submissionWorkerPool.mjs');
+            await updateJobDistributionWithCheck({
+              distributionId: task.id,
+              workerId,
+              patch: distUpdate,
+            });
+          } catch {
+            const { error: dErr } = await supabase.from('job_distributions').update(distUpdate).eq('id', task.id);
+            if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions by id:`, dErr.message);
+          }
         } else {
           const { error: dErr } = await supabase.from('job_distributions').update(distUpdate).eq('applywizz_id', applywizzId).eq('job_url', jobUrl);
           if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions by applywizz_id/url:`, dErr.message);
@@ -1195,9 +1210,15 @@ export async function executeWorkerTask({
         const { detectWorkdayStep } = await import('./stateDetector.mjs');
         const liveStep = await detectWorkdayStep(page).catch(() => null);
         if (liveStep && liveStep !== 'Unknown') errStep = liveStep;
-        const buf = await page.screenshot({ type: 'jpeg', quality: 75 }).catch(() => null);
+        const buf = await page.screenshot({ type: 'png' }).catch(() => null);
         if (buf) {
-          errShotUrl = await uploadStorageScreenshot('application-failures', `${applywizzId}_${Date.now()}_error.jpg`, buf);
+          const timestamp = Date.now();
+          const effectiveTaskId = taskId || task.id || timestamp;
+          const failStoragePath = `${applywizzId}/${effectiveTaskId}_failed_${timestamp}.png`;
+          errShotUrl = await uploadStorageScreenshot('submitted-applications', failStoragePath, buf);
+          if (errShotUrl) {
+            console.log(`[${workerId}] screenshot uploaded: ${failStoragePath}`);
+          }
         }
       }
     } catch {}
@@ -1273,6 +1294,7 @@ export async function executeWorkerTask({
 
     return { status: 'error', error: err.message, cacheHit, screenshotUrl: errShotUrl, stoppedAtStep: errStep };
   } finally {
+    try { unregisterWorkerContext(workerId); } catch {}
     try { await updateWorkerStatus(workerId, { state: 'idle', current_application_id: null }); } catch {}
     try {
       unregisterActiveBrowser(browser);
