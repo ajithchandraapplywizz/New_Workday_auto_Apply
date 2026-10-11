@@ -19,11 +19,18 @@ export const PIPELINE_CONFIG = {
     IDLE: 'idle',
   },
 
-  workersCount: 9,
+  workersCount: 12,
 
   scanWorkerIds: ['scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3'],
   resolveWorkerIds: ['resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3'],
-  submitWorkerIds: ['submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3'],
+  submitWorkerIds: [
+    'submitting_worker_1',
+    'submitting_worker_2',
+    'submitting_worker_3',
+    'submitting_worker_4',
+    'submitting_worker_5',
+    'submitting_worker_6',
+  ],
 
   workerNames: {
     scanning_worker_1: 'Scanning Worker 1',
@@ -35,12 +42,16 @@ export const PIPELINE_CONFIG = {
     submitting_worker_1: 'Submitting Worker 1',
     submitting_worker_2: 'Submitting Worker 2',
     submitting_worker_3: 'Submitting Worker 3',
+    submitting_worker_4: 'Submitting Worker 4',
+    submitting_worker_5: 'Submitting Worker 5',
+    submitting_worker_6: 'Submitting Worker 6',
   },
 
   allWorkerIds: [
     'scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3',
     'resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3',
-    'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3'
+    'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
+    'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
   ],
 
   webhookPort: Number(process.env.DAEMON_PORT) || 3001,

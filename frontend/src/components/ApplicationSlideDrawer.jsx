@@ -21,11 +21,13 @@ import {
 import {
   fetchApplicationFormReviewData,
   saveAnswerToQaBank,
+  submitTaskByTaskId,
   submitApplicationReview,
   isPersonalInfoField,
   resolveSupabaseStorageUrl,
   cleanCanonicalJobUrl
 } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 import { supabase } from '../config/supabase';
 import './ApplicationSlideDrawer.css';
 
@@ -44,6 +46,9 @@ export default function ApplicationSlideDrawer({
   onStatusUpdated,
   readOnly = false,
 }) {
+  const auth = useAuth?.() || {};
+  const activeCaEmail = auth?.user?.email || 'sana@applywizz.com';
+
   const [loading, setLoading] = useState(false);
   const [appDetails, setAppDetails] = useState(null);
   const [fields, setFields] = useState([]);
@@ -142,67 +147,59 @@ export default function ApplicationSlideDrawer({
     return () => { isMounted = false; };
   }, [isOpen, applywizzId, jobUrl, distributionId, currentStatus]);
 
-  // Live polling for this specific application in job_distributions
-  // Live polling for this specific application in job_distributions and applications
+  // Live polling & Realtime for this specific application task in submission_tasks
   useEffect(() => {
-    if (!isOpen || (!distributionId && (!applywizzId || !jobUrl))) return;
+    if (!isOpen) return;
 
     let isMounted = true;
+    const targetTaskId = appDetails?.taskId || appDetails?.task_id || application?.taskId || application?.task_id || null;
+
     const interval = setInterval(async () => {
       try {
+        let taskRow = null;
+        if (targetTaskId) {
+          const { data: tData } = await supabase.from('submission_tasks').select('*').eq('id', targetTaskId).maybeSingle();
+          if (tData) taskRow = tData;
+        } else if (distributionId) {
+          const { data: tData } = await supabase.from('submission_tasks').select('*').eq('distribution_id', distributionId).maybeSingle();
+          if (tData) taskRow = tData;
+        }
+
         let updated = null;
         if (distributionId) {
           const { data } = await supabase.from('job_distributions').select('*').eq('id', distributionId).limit(1);
           if (data && data.length > 0) updated = data[0];
         }
-        if (!updated && applywizzId && jobUrl) {
-          const { data } = await supabase.from('job_distributions').select('*').eq('applywizz_id', applywizzId).eq('job_url', jobUrl).limit(1);
-          if (data && data.length > 0) updated = data[0];
-          if (!updated) {
-            const canonical = cleanCanonicalJobUrl(jobUrl);
-            if (canonical && canonical !== jobUrl) {
-              const { data: cData } = await supabase.from('job_distributions').select('*').eq('applywizz_id', applywizzId).eq('job_url', canonical).limit(1);
-              if (cData && cData.length > 0) updated = cData[0];
-            }
-          }
-        }
-
-        // Also check applications table
-        let appRow = null;
-        if (applywizzId && jobUrl) {
-          const { data: aData } = await supabase.from('applications').select('*').eq('applywizz_id', applywizzId).eq('job_url', jobUrl).limit(1);
-          if (aData && aData.length > 0) appRow = aData[0];
-          if (!appRow) {
-            const canonical = cleanCanonicalJobUrl(jobUrl);
-            if (canonical && canonical !== jobUrl) {
-              const { data: cData } = await supabase.from('applications').select('*').eq('applywizz_id', applywizzId).eq('job_url', canonical).limit(1);
-              if (cData && cData.length > 0) appRow = cData[0];
-            }
-          }
-        }
 
         if (!isMounted) return;
 
-        const latestStatus = updated?.status || appRow?.status || null;
+        const effectiveTaskId = taskRow?.id || targetTaskId || null;
+        const effectiveWorkerId = taskRow?.worker_id || updated?.worker_id || null;
+        const latestStatus = taskRow?.status || updated?.status || null;
         const isLatestSubmitted = latestStatus === 'submitted' || latestStatus === 'completed';
 
         const rawProof = isLatestSubmitted
-          ? (updated?.application_submitted_screenshot_url
-            || updated?.applied_screenshot
-            || appRow?.screenshot_url
-            || appRow?.applied_screenshot
-            || null)
+          ? (taskRow?.application_submitted_screenshot_url || updated?.application_submitted_screenshot_url || null)
           : null;
 
         const resolvedProof = resolveSupabaseStorageUrl(rawProof);
 
-        if (resolvedProof || latestStatus) {
+        if (resolvedProof || latestStatus || effectiveWorkerId || effectiveTaskId) {
           setAppDetails((prev) => ({
             ...prev,
+            taskId: effectiveTaskId || prev?.taskId,
+            task_id: effectiveTaskId || prev?.task_id,
             status: latestStatus || prev?.status,
-            screenshotUrl: resolvedProof || null,
-            application_submitted_screenshot_url: resolvedProof || null,
+            worker_id: effectiveWorkerId || prev?.worker_id,
+            screenshotUrl: resolvedProof || prev?.screenshotUrl,
+            application_submitted_screenshot_url: resolvedProof || prev?.application_submitted_screenshot_url,
           }));
+
+          if (latestStatus === 'queued') {
+            setActionMessage('⏳ Queued: Waiting for next available submitting worker...');
+          } else if (latestStatus === 'applying' && effectiveWorkerId) {
+            setActionMessage(`⚡ Applying on Workday via ${effectiveWorkerId.replace('_', ' ')}...`);
+          }
 
           if (isLatestSubmitted && resolvedProof) {
             setSubmitting(false);
@@ -210,7 +207,10 @@ export default function ApplicationSlideDrawer({
             if (onStatusUpdated) {
               onStatusUpdated({
                 ...application,
+                taskId: effectiveTaskId,
+                task_id: effectiveTaskId,
                 status: latestStatus || 'submitted',
+                worker_id: effectiveWorkerId,
                 application_submitted_screenshot_url: resolvedProof,
                 screenshot_url: resolvedProof,
               });
@@ -220,13 +220,55 @@ export default function ApplicationSlideDrawer({
       } catch (e) {
         // silent polling catch
       }
-    }, 1500);
+    }, 2000);
+
+    // Supabase Realtime channel for instant updates
+    let channel = null;
+    if (targetTaskId) {
+      channel = supabase
+        .channel(`drawer_task_sub_${targetTaskId}`)
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'submission_tasks',
+          filter: `id=eq.${targetTaskId}`,
+        }, (payload) => {
+          const fresh = payload.new;
+          if (!fresh || !isMounted) return;
+          const shot = resolveSupabaseStorageUrl(fresh.application_submitted_screenshot_url || null);
+          setAppDetails((prev) => ({
+            ...prev,
+            status: fresh.status,
+            worker_id: fresh.worker_id || prev?.worker_id,
+            screenshotUrl: shot || prev?.screenshotUrl,
+            application_submitted_screenshot_url: shot || prev?.application_submitted_screenshot_url,
+          }));
+
+          if (fresh.status === 'submitted') {
+            setSubmitting(false);
+            setActionMessage('✓ Application successfully submitted on Workday! Proof screenshot captured.');
+            if (onStatusUpdated) {
+              onStatusUpdated({
+                ...application,
+                taskId: fresh.id,
+                task_id: fresh.id,
+                status: 'submitted',
+                worker_id: fresh.worker_id,
+                application_submitted_screenshot_url: shot,
+                screenshot_url: shot,
+              });
+            }
+          }
+        })
+        .subscribe();
+    }
 
     return () => {
       isMounted = false;
       clearInterval(interval);
+      if (channel) supabase.removeChannel(channel);
     };
-  }, [isOpen, distributionId, applywizzId, jobUrl]);
+  }, [isOpen, distributionId, applywizzId, jobUrl, appDetails?.taskId, appDetails?.task_id, application?.taskId, application?.task_id]);
 
   // Missing / Unanswered Questions
   const missingFields = useMemo(() => {
@@ -306,7 +348,8 @@ export default function ApplicationSlideDrawer({
     }
   };
 
-  // Handle CA Review & Submit action
+  // Handle CA Review & Submit action (Phase 2 & Phase 5 Master Plan)
+  // One identity end-to-end: submission_tasks.id. Exactly ONE application queued.
   const handleConfirmAndSubmit = async () => {
     if (!applywizzId || (!jobUrl && !distributionId)) return;
     if (missingFields.length > 0) {
@@ -315,35 +358,71 @@ export default function ApplicationSlideDrawer({
     }
     if (submitting) return;
 
-    setSubmitting(true);
-    setActionMessage('Autonomous worker active: Submitting application on Workday...');
+    let targetTaskId = appDetails?.taskId || appDetails?.task_id || application?.taskId || application?.task_id || null;
+    if (!targetTaskId && distributionId) {
+      try {
+        const { data: stRow } = await supabase
+          .from('submission_tasks')
+          .select('id')
+          .eq('distribution_id', distributionId)
+          .maybeSingle();
+        if (stRow?.id) targetTaskId = stRow.id;
+      } catch {}
+    }
 
-    // Set local status immediately so CA sees applying pulse
+    if (!targetTaskId) {
+      setActionMessage('⚠️ Error: No submission task mapped to this application.');
+      return;
+    }
+
+    setSubmitting(true);
+    setActionMessage('⏳ Queuing application for submitting worker pool...');
+
+    // Optimistic UI: update ONLY this single application to 'queued'
     setAppDetails((prev) => ({
       ...prev,
-      status: 'applying',
+      taskId: targetTaskId,
+      task_id: targetTaskId,
+      status: 'queued',
     }));
 
     if (onStatusUpdated) {
-      onStatusUpdated({ ...application, status: 'applying' });
+      onStatusUpdated({
+        ...application,
+        id: distributionId || application?.id,
+        distributionId: distributionId || application?.distributionId,
+        taskId: targetTaskId,
+        task_id: targetTaskId,
+        job_url: jobUrl || application?.job_url,
+        status: 'queued',
+      });
     }
 
     try {
-      // Trigger targeted single-item background submission
-      await submitApplicationReview({
-        applywizzId,
-        jobUrl,
-        distributionId: appDetails?.id || distributionId,
-        company: appDetails?.company || application?.company || 'Workday Employer',
-        roleTitle: appDetails?.roleTitle || application?.role_title || 'Role',
-        fields,
-        status: 'approved_for_submission',
+      // POST /api/submissions/:taskId/submit with active CA identity
+      const res = await submitTaskByTaskId({
+        taskId: targetTaskId,
+        caEmail: activeCaEmail,
       });
 
-      setActionMessage('✓ Submission dispatched to submitting worker. Monitoring live Workday progress...');
+      if (!res.success) {
+        setActionMessage('Submit failed: ' + (res.error || 'Failed to queue'));
+        setSubmitting(false);
+        setAppDetails((prev) => ({ ...prev, status: 'ready_for_review' }));
+        if (onStatusUpdated) {
+          onStatusUpdated({ ...application, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
+        }
+        return;
+      }
+
+      setActionMessage('✓ Queued for submission. Worker pool will claim and process.');
     } catch (err) {
-      setActionMessage('Submit failed: ' + err.message);
+      setActionMessage('Submit error: ' + err.message);
       setSubmitting(false);
+      setAppDetails((prev) => ({ ...prev, status: 'ready_for_review' }));
+      if (onStatusUpdated) {
+        onStatusUpdated({ ...application, taskId: targetTaskId, task_id: targetTaskId, status: 'ready_for_review' });
+      }
     }
   };
 
@@ -355,15 +434,20 @@ export default function ApplicationSlideDrawer({
   let statusLabel = 'Ready For Review';
   let StatusIcon = CheckCircle2;
 
-  if (effectiveStatus.includes('submit')) {
+  if (effectiveStatus.includes('submit') || effectiveStatus === 'completed') {
     statusBadgeClass = 'badge-submitted';
     statusLabel = 'Submitted';
     StatusIcon = Check;
+  } else if (effectiveStatus.includes('flight') || effectiveStatus.includes('apply')) {
+    statusBadgeClass = 'badge-applying';
+    const workerShort = appDetails?.worker_id ? ` • ${appDetails.worker_id.replace('submitting_worker_', 'Worker ')}` : '';
+    statusLabel = `Applying on Workday${workerShort}`;
+    StatusIcon = Sparkles;
   } else if (effectiveStatus.includes('queue')) {
     statusBadgeClass = 'badge-queued';
-    statusLabel = 'Queued';
+    statusLabel = 'Queued for Submitting Worker';
     StatusIcon = Clock;
-  } else if (effectiveStatus.includes('need') || missingFields.length > 0) {
+  } else if (effectiveStatus.includes('need') || (missingFields.length > 0 && effectiveStatus !== 'applying')) {
     statusBadgeClass = 'badge-needs-answers';
     statusLabel = `Needs Answers (${missingFields.length})`;
     StatusIcon = AlertTriangle;
@@ -371,18 +455,18 @@ export default function ApplicationSlideDrawer({
     statusBadgeClass = 'badge-failed';
     statusLabel = 'Failed';
     StatusIcon = AlertTriangle;
-  } else if (effectiveStatus.includes('flight') || effectiveStatus.includes('apply')) {
-    statusBadgeClass = 'badge-applying';
-    statusLabel = 'Applying';
-    StatusIcon = Sparkles;
   }
 
   const isFinalSubmitted = effectiveStatus.includes('submit') || effectiveStatus === 'completed';
   const rawProofShot = isFinalSubmitted
     ? (appDetails?.application_submitted_screenshot_url
-      || appDetails?.applied_screenshot
       || application?.application_submitted_screenshot_url
+      || appDetails?.screenshot_path
+      || application?.screenshot_path
+      || appDetails?.applied_screenshot
       || application?.applied_screenshot
+      || appDetails?.screenshot_url
+      || application?.screenshot_url
       || null)
     : null;
 
@@ -792,30 +876,38 @@ export default function ApplicationSlideDrawer({
                 type="button"
                 className="sd-btn-primary"
                 onClick={handleConfirmAndSubmit}
-                disabled={submitting || missingFields.length > 0 || effectiveStatus === 'applying'}
+                disabled={submitting || missingFields.length > 0 || effectiveStatus === 'applying' || effectiveStatus === 'queued'}
                 style={{
                   background: (submitting || effectiveStatus === 'applying')
                     ? 'linear-gradient(135deg, #a855f7 0%, #7e22ce 100%)'
-                    : (missingFields.length > 0
+                    : (effectiveStatus === 'queued'
                       ? 'linear-gradient(135deg, #d97706 0%, #b45309 100%)'
-                      : 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)'),
-                  boxShadow: missingFields.length > 0
-                    ? '0 4px 12px rgba(217, 119, 6, 0.35)'
-                    : '0 4px 12px rgba(2, 132, 199, 0.35)',
-                  cursor: (missingFields.length > 0 || submitting || effectiveStatus === 'applying') ? 'not-allowed' : 'pointer',
-                  opacity: (missingFields.length > 0 || submitting || effectiveStatus === 'applying') ? 0.8 : 1,
+                      : (missingFields.length > 0
+                        ? 'linear-gradient(135deg, #64748b 0%, #475569 100%)'
+                        : 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)')),
+                  boxShadow: (submitting || effectiveStatus === 'applying')
+                    ? '0 4px 12px rgba(168, 85, 247, 0.35)'
+                    : (effectiveStatus === 'queued'
+                      ? '0 4px 12px rgba(217, 119, 6, 0.35)'
+                      : '0 4px 12px rgba(2, 132, 199, 0.35)'),
+                  cursor: (missingFields.length > 0 || submitting || effectiveStatus === 'applying' || effectiveStatus === 'queued') ? 'not-allowed' : 'pointer',
+                  opacity: (missingFields.length > 0 || submitting || effectiveStatus === 'applying' || effectiveStatus === 'queued') ? 0.8 : 1,
                 }}
-                title={missingFields.length > 0 ? `Please answer all ${missingFields.length} missing question(s) above before submitting` : 'Review & Submit this application'}
+                title={missingFields.length > 0 ? `Please answer all ${missingFields.length} missing question(s) above before submitting` : (effectiveStatus === 'queued' ? 'Task queued in worker pool' : 'Review & Submit this application')}
               >
-                {missingFields.length > 0 ? (
+                {effectiveStatus === 'queued' ? (
+                  <Clock size={15} />
+                ) : missingFields.length > 0 ? (
                   <AlertTriangle size={15} />
                 ) : (
                   <Send size={15} />
                 )}
                 <span>
-                  {(submitting || effectiveStatus === 'applying')
-                    ? 'Applying on Workday...'
-                    : (missingFields.length > 0 ? `Needs Answers (${missingFields.length})` : 'Review & Submit')}
+                  {effectiveStatus === 'queued'
+                    ? '⏳ In Queue (Submitting Worker Pending)...'
+                    : (submitting || effectiveStatus === 'applying')
+                      ? '⚡ Applying on Workday...'
+                      : (missingFields.length > 0 ? `Needs Answers (${missingFields.length})` : 'Review & Submit')}
                 </span>
               </button>
             ) : (

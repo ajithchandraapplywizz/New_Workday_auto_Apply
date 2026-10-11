@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { getYesterdayDateStr } from '../utils/dateUtils';
+import { getYesterdayDateStr, getWorkdayInfo } from '../utils/dateUtils';
 import {
   fetchClientDetails,
   fetchClientQuestions,
@@ -12,6 +12,8 @@ import {
   triggerAutonomousBot,
   stopAutonomousBot,
   resolveSupabaseStorageUrl,
+  fetchDynamicCandidateCounts,
+  submitTaskByTaskId,
 } from '../services/api';
 import { supabase } from '../config/supabase';
 import {
@@ -47,8 +49,9 @@ import ApplicationSlideDrawer from '../components/ApplicationSlideDrawer';
 export default function CADashboard() {
   const { user, date } = useAuth();
 
-  // CA work history data is strictly locked to yesterday (T-1)
-  const yesterdayDate = useMemo(() => getYesterdayDateStr(), []);
+  // CA work history data is strictly locked to previous working day (5-day business week rule)
+  const workdayInfo = useMemo(() => getWorkdayInfo(), []);
+  const yesterdayDate = workdayInfo.dateStr;
 
   const [applywizzId, setApplywizzId] = useState('');
   const [loadingClient, setLoadingClient] = useState(false);
@@ -153,32 +156,47 @@ export default function CADashboard() {
   };
 
   const handleReviewSubmitted = (updatedApp) => {
-    setApplyStep(4);
-    setApplyLog((prev) => [
-      ...prev,
-      `[${new Date().toLocaleTimeString()}] Form answers confirmed and submitted by Career Associate!`,
-      `[${new Date().toLocaleTimeString()}] Recorded changes in public.applications & job_distributions.`,
-    ]);
-    if (updatedApp) {
-      const proof = resolveSupabaseStorageUrl(updatedApp.application_submitted_screenshot_url || updatedApp.screenshot_url);
-      setClientJobs((prev) =>
-        prev.map((j) => {
-          if (j.id === updatedApp.id || j.job_url === updatedApp.job_url) {
-            return {
-              ...j,
-              status: 'submitted',
-              application_submitted_screenshot_url: proof || j.application_submitted_screenshot_url,
-              applied_screenshot: proof || j.applied_screenshot,
-              screenshot_url: proof || j.screenshot_url,
-            };
-          }
-          return j;
-        })
-      );
+    if (!updatedApp) return;
+    const targetStatus = updatedApp.status || 'queued';
+    const isSubmitted = targetStatus === 'submitted' || targetStatus === 'completed';
+
+    if (isSubmitted) {
+      setApplyStep(4);
+      setApplyLog((prev) => [
+        ...prev,
+        `[${new Date().toLocaleTimeString()}] Form answers confirmed and submitted by Career Associate!`,
+        `[${new Date().toLocaleTimeString()}] Recorded changes in public.applications & job_distributions.`,
+      ]);
     }
-    if (applywizzId) {
-      loadClientProfile(applywizzId);
-    }
+
+    const proof = resolveSupabaseStorageUrl(updatedApp.application_submitted_screenshot_url || updatedApp.screenshot_url);
+    const targetId = updatedApp.id || updatedApp.distributionId;
+    const targetTaskId = updatedApp.taskId || updatedApp.task_id;
+    const targetUrl = (updatedApp.job_url || '').split('?')[0].trim().toLowerCase();
+
+    setClientJobs((prev) =>
+      prev.map((j) => {
+        const jUrl = (j.job_url || '').split('?')[0].trim().toLowerCase();
+        const isMatch = Boolean(
+          (targetId && (j.id === targetId || j.distributionId === targetId)) ||
+          (targetTaskId && (j.taskId === targetTaskId || j.task_id === targetTaskId)) ||
+          (targetUrl && jUrl && jUrl === targetUrl)
+        );
+
+        if (isMatch) {
+          return {
+            ...j,
+            status: targetStatus,
+            taskId: targetTaskId || j.taskId,
+            task_id: targetTaskId || j.task_id,
+            application_submitted_screenshot_url: proof || j.application_submitted_screenshot_url,
+            applied_screenshot: proof || j.applied_screenshot,
+            screenshot_url: proof || j.screenshot_url,
+          };
+        }
+        return j;
+      })
+    );
   };
 
   // Record CA's active status in Supabase upon viewing the console
@@ -212,14 +230,20 @@ export default function CADashboard() {
 
         if (!isMounted) return;
 
+        const countMap = await fetchDynamicCandidateCounts();
+
         if (res.success && res.assignments && res.assignments.length > 0) {
-          const list = res.assignments.map((a) => ({
-            applywizz_id: a.applywizz_id,
-            client_name: a.client_name || a.applywizz_id,
-            company_email: a.client_email || '',
-            jobs_applied: a.jobs_applied || 0,
-            date: a.date,
-          }));
+          const list = res.assignments.map((a) => {
+            const cid = (a.applywizz_id || '').toUpperCase();
+            const dynamicCount = countMap.get(cid) ?? (typeof a.jobs_applied === 'number' ? a.jobs_applied : 0);
+            return {
+              applywizz_id: a.applywizz_id,
+              client_name: a.client_name || a.applywizz_id,
+              company_email: a.client_email || '',
+              jobs_applied: dynamicCount,
+              date: a.date,
+            };
+          });
           setCandidateList(list);
           const firstId = list[0].applywizz_id;
           setApplywizzId(firstId);
@@ -229,8 +253,15 @@ export default function CADashboard() {
           const fb = await fetchClients({ limit: 10 });
           if (!isMounted) return;
           if (fb.success && fb.clients && fb.clients.length > 0) {
-            setCandidateList(fb.clients);
-            const firstId = fb.clients[0].applywizz_id;
+            const mappedFb = fb.clients.map((c) => {
+              const cid = (c.applywizz_id || '').toUpperCase();
+              return {
+                ...c,
+                jobs_applied: countMap.get(cid) ?? c.jobs_applied ?? 0,
+              };
+            });
+            setCandidateList(mappedFb);
+            const firstId = mappedFb[0].applywizz_id;
             setApplywizzId(firstId);
             loadClientProfile(firstId);
           }
@@ -246,6 +277,84 @@ export default function CADashboard() {
     return () => { isMounted = false; };
   }, [activeCaEmail, yesterdayDate]);
 
+  // Dynamic Realtime update: Whenever job_distributions entries change (new jobs arrive or answers update),
+  // immediately re-calculate counts dynamically for all clients without needing to click or refresh
+  useEffect(() => {
+    const channel = supabase
+      .channel('ca_realtime_job_distributions_counts')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'job_distributions' }, async () => {
+        try {
+          const freshCounts = await fetchDynamicCandidateCounts();
+          setCandidateList((prev) =>
+            prev.map((c) => {
+              const cid = (c.applywizz_id || '').toUpperCase();
+              return {
+                ...c,
+                jobs_applied: freshCounts.get(cid) ?? c.jobs_applied ?? 0,
+              };
+            })
+          );
+        } catch (e) {
+          console.warn('Realtime CA candidate count update note:', e.message);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Realtime updates for submission_tasks for active client (Phase 5 Master Plan)
+  useEffect(() => {
+    if (!applywizzId) return;
+    const cleanId = String(applywizzId).trim().toUpperCase();
+
+    const channel = supabase
+      .channel(`ca_realtime_submission_tasks_${cleanId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'submission_tasks',
+        filter: `applywizz_id=eq.${cleanId}`,
+      }, (payload) => {
+        const freshTask = payload.new;
+        if (!freshTask) return;
+        const freshProof = resolveSupabaseStorageUrl(freshTask.application_submitted_screenshot_url || null);
+        const taskUrl = (freshTask.job_url || '').split('?')[0].trim().toLowerCase();
+
+        setClientJobs((prevJobs) => {
+          return prevJobs.map((j) => {
+            const jUrl = (j.job_url || '').split('?')[0].trim().toLowerCase();
+            const isMatch = Boolean(
+              (freshTask.id && (j.taskId === freshTask.id || j.task_id === freshTask.id)) ||
+              (freshTask.distribution_id && (j.id === freshTask.distribution_id || j.distributionId === freshTask.distribution_id)) ||
+              (taskUrl && jUrl && jUrl === taskUrl)
+            );
+
+            if (isMatch) {
+              return {
+                ...j,
+                taskId: freshTask.id,
+                task_id: freshTask.id,
+                status: freshTask.status,
+                worker_id: freshTask.worker_id || j.worker_id,
+                application_submitted_screenshot_url: freshProof || j.application_submitted_screenshot_url,
+                applied_screenshot: freshProof || j.applied_screenshot,
+                screenshot_url: freshProof || j.screenshot_url,
+              };
+            }
+            return j;
+          });
+        });
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [applywizzId]);
+
   // Fetch client details, questions, and real jobs from Supabase
   const loadClientProfile = async (idToLoad) => {
     const id = idToLoad || applywizzId;
@@ -255,11 +364,12 @@ export default function CADashboard() {
     setApplyLog([]);
 
     try {
-      const [detailsRes, qaRes, distRes, scannedRes] = await Promise.all([
+      const [detailsRes, qaRes, distRes, scannedRes, subTasksRes] = await Promise.all([
         fetchClientDetails(id),
         fetchClientQuestions({ applywizzId: id, limit: 50 }),
         supabase.from('job_distributions').select('*').eq('applywizz_id', id).order('created_at', { ascending: false }),
         supabase.from('scanned_jobs').select('job_url, screenshot_path, scraped_questions, question_count').limit(1000),
+        supabase.from('submission_tasks').select('*').eq('applywizz_id', id).order('created_at', { ascending: false }),
       ]);
 
       if (detailsRes.success && detailsRes.client) {
@@ -281,6 +391,14 @@ export default function CADashboard() {
         }
       }
 
+      // Map submission_tasks by distribution_id
+      const subTaskByDistId = new Map();
+      if (subTasksRes.data && Array.isArray(subTasksRes.data)) {
+        for (const st of subTasksRes.data) {
+          if (st.distribution_id) subTaskByDistId.set(st.distribution_id, st);
+        }
+      }
+
       // Query job_distributions: display all candidate applications in review & submission pipeline
       const jobsMap = new Map();
       if (distRes.data && distRes.data.length > 0) {
@@ -289,37 +407,44 @@ export default function CADashboard() {
           if (!u || jobsMap.has(u)) continue;
 
           const sj = scannedMap.get(u) || scannedMap.get((dj.job_url || '').trim().toLowerCase());
-          const st = (dj.status || '').toLowerCase();
-          const isAllowedStatus = ['ready_for_review', 'ready_to_review', 'review_and_submit', 'distributed', 'applying', 'in_flight', 'submitted', 'completed', 'needs_answers', 'failed'].includes(st);
+          const subTask = subTaskByDistId.get(dj.id);
+          const taskId = subTask?.id || null;
+          const effectiveStatus = subTask?.status || ((dj.status === 'distributed' || dj.status === 'ready_to_review') ? 'ready_for_review' : dj.status);
+          const effectiveWorker = subTask?.worker_id || dj.worker_id || null;
+          const isAllowedStatus = ['ready_for_review', 'ready_to_review', 'review_and_submit', 'distributed', 'queued', 'queued_for_submission', 'applying', 'in_flight', 'submitted', 'completed', 'needs_answers', 'failed'].includes(effectiveStatus);
           if (!isAllowedStatus) continue;
 
-            const rawProof = dj.application_submitted_screenshot_url
-              || dj.applied_screenshot
-              || dj.original_application_screenshot_successful
-              || dj.final_submission_screenshot_url
-              || dj.screenshot_url
-              || dj.screenshot_path
-              || null;
-            const proofShot = resolveSupabaseStorageUrl(rawProof);
+          // Strict filtering: CA dashboard only displays applications that are fully answered (or already submitted)
+          const isFullyAnsweredOrSubmitted = (dj.is_fully_answered === true) || effectiveStatus === 'submitted' || effectiveStatus === 'completed';
+          if (!isFullyAnsweredOrSubmitted) continue;
 
-            jobsMap.set(u, {
-              id: dj.id,
-              applywizz_id: dj.applywizz_id,
-              job_url: dj.job_url,
-              company: dj.company || sj?.company || 'Workday Partner',
-              role_title: dj.role_title || sj?.role_title || 'Workday Application',
-              status: (dj.status === 'distributed' || dj.status === 'ready_to_review') ? 'ready_for_review' : dj.status,
-              is_fully_answered: dj.is_fully_answered,
-              resolved_answers: dj.resolved_answers || [],
-              unanswered_count: dj.unanswered_count || 0,
-              unanswered_questions: dj.unanswered_questions || [],
-              applied_screenshot: proofShot,
-              application_submitted_screenshot_url: proofShot,
-              screenshot_url: proofShot,
-              blueprint_screenshot: resolveSupabaseStorageUrl(sj?.screenshot_path) || null,
-              scraped_questions: dj.scraped_questions || sj?.scraped_questions || [],
-              source: 'job_distributions',
-            });
+          const rawProof = (effectiveStatus === 'submitted' || effectiveStatus === 'completed')
+            ? (subTask?.application_submitted_screenshot_url || dj.application_submitted_screenshot_url || subTask?.screenshot_path || null)
+            : null;
+          const proofShot = resolveSupabaseStorageUrl(rawProof);
+
+          jobsMap.set(u, {
+            id: dj.id,
+            distributionId: dj.id,
+            taskId: taskId,
+            task_id: taskId,
+            applywizz_id: dj.applywizz_id,
+            job_url: dj.job_url,
+            company: dj.company || sj?.company || 'Workday Partner',
+            role_title: dj.role_title || sj?.role_title || 'Workday Application',
+            status: effectiveStatus,
+            worker_id: effectiveWorker,
+            is_fully_answered: dj.is_fully_answered,
+            resolved_answers: dj.resolved_answers || [],
+            unanswered_count: dj.unanswered_count || 0,
+            unanswered_questions: dj.unanswered_questions || [],
+            applied_screenshot: proofShot,
+            application_submitted_screenshot_url: proofShot,
+            screenshot_url: proofShot,
+            blueprint_screenshot: resolveSupabaseStorageUrl(sj?.screenshot_path) || null,
+            scraped_questions: dj.scraped_questions || sj?.scraped_questions || [],
+            source: 'job_distributions',
+          });
         }
       }
 
@@ -364,16 +489,84 @@ export default function CADashboard() {
 
 
 
-  // Live polling: automatically reflects real-time status in job_distributions and batch_job_queue
+  // Handle 1-click Review & Submit on a specific card (Phase 2 & Phase 5 Master Plan)
+  const handleCardQuickSubmit = async (e, job) => {
+    e.stopPropagation();
+    let targetTaskId = job.taskId || job.task_id;
+    if (!targetTaskId && job.id) {
+      try {
+        const { data: stRow } = await supabase
+          .from('submission_tasks')
+          .select('id')
+          .eq('distribution_id', job.id)
+          .maybeSingle();
+        if (stRow?.id) targetTaskId = stRow.id;
+      } catch {}
+    }
+
+    if (!targetTaskId) {
+      setActiveTask(job);
+      setSelectedAppForDrawer(job);
+      setShowSlideDrawer(true);
+      return;
+    }
+
+    // Optimistic UI: update ONLY this single application to 'queued' (by task id or distribution id ONLY)
+    const targetJobId = job.id || job.distributionId;
+
+    setClientJobs((prevJobs) =>
+      prevJobs.map((j) => {
+        const isMatch = Boolean(
+          (targetTaskId && (j.taskId === targetTaskId || j.task_id === targetTaskId)) ||
+          (targetJobId && (j.id === targetJobId || j.distributionId === targetJobId))
+        );
+        return isMatch ? { ...j, status: 'queued', taskId: targetTaskId || j.taskId, task_id: targetTaskId || j.task_id } : j;
+      })
+    );
+
+    try {
+      const res = await submitTaskByTaskId({ taskId: targetTaskId, caEmail: activeCaEmail });
+      if (!res.success) {
+        alert('Submit failed: ' + (res.error || 'Failed to queue task'));
+        setClientJobs((prevJobs) =>
+          prevJobs.map((j) => {
+            const isMatch = Boolean(
+              (targetTaskId && (j.taskId === targetTaskId || j.task_id === targetTaskId)) ||
+              (targetJobId && (j.id === targetJobId || j.distributionId === targetJobId))
+            );
+            return isMatch ? { ...j, status: 'ready_for_review' } : j;
+          })
+        );
+      }
+    } catch (err) {
+      alert('Submit error: ' + err.message);
+      setClientJobs((prevJobs) =>
+        prevJobs.map((j) => {
+          const isMatch = Boolean(
+            (targetTaskId && (j.taskId === targetTaskId || j.task_id === targetTaskId)) ||
+            (targetJobId && (j.id === targetJobId || j.distributionId === targetJobId))
+          );
+          return isMatch ? { ...j, status: 'ready_for_review' } : j;
+        })
+      );
+    }
+  };
+
+  // Live polling: automatically reflects real-time status in job_distributions, submission_tasks, and batch_job_queue
   useEffect(() => {
     if (!applywizzId) return;
     let isMounted = true;
 
     const intervalId = setInterval(async () => {
       try {
-        const [distRes, queueRes] = await Promise.all([
+        const [distRes, subTasksRes, queueRes] = await Promise.all([
           supabase
             .from('job_distributions')
+            .select('*')
+            .eq('applywizz_id', applywizzId)
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('submission_tasks')
             .select('*')
             .eq('applywizz_id', applywizzId)
             .order('created_at', { ascending: false }),
@@ -387,37 +580,55 @@ export default function CADashboard() {
 
         if (!isMounted) return;
 
-        // 1. Update clientJobs in real-time from job_distributions
+        const subTasksByDist = new Map();
+        if (subTasksRes.data && Array.isArray(subTasksRes.data)) {
+          for (const st of subTasksRes.data) {
+            if (st.distribution_id) subTasksByDist.set(st.distribution_id, st);
+          }
+        }
+
+        // 1. Update clientJobs in real-time from job_distributions & submission_tasks
         if (distRes.data && distRes.data.length > 0) {
           const freshMap = new Map();
           for (const d of distRes.data) {
-            freshMap.set(d.id || d.job_url, d);
+            if (d.id) freshMap.set(d.id, d);
           }
 
           setClientJobs((prevJobs) => {
             let changed = false;
             const updated = prevJobs.map((j) => {
-              const f = freshMap.get(j.id) || freshMap.get(j.job_url);
-              if (f) {
-                const freshProof = resolveSupabaseStorageUrl(
-                  f.application_submitted_screenshot_url
-                  || f.applied_screenshot
-                  || f.original_application_screenshot_successful
-                  || f.final_submission_screenshot_url
-                  || f.screenshot_url
-                  || f.screenshot_path
-                  || null
-                );
-                if (f.status !== j.status || freshProof !== j.application_submitted_screenshot_url) {
-                  changed = true;
-                  return {
-                    ...j,
-                    status: (f.status === 'distributed' || f.status === 'ready_to_review') ? 'ready_for_review' : f.status,
-                    application_submitted_screenshot_url: freshProof,
-                    applied_screenshot: freshProof,
-                    screenshot_url: freshProof,
-                  };
-                }
+              const distId = j.id || j.distributionId;
+              const f = distId ? freshMap.get(distId) : null;
+
+              // A4: Find submission_tasks row by distribution_id ONLY (no URL or other fallback keys)
+              const st = distId ? subTasksByDist.get(distId) : null;
+
+              // Row status comes from submission_tasks; use job_distributions status only when no task row exists
+              const effectiveStatus = st
+                ? st.status
+                : ((f?.status === 'distributed' || f?.status === 'ready_to_review') ? 'ready_for_review' : (f?.status || j.status));
+              const effectiveWorker = st?.worker_id || f?.worker_id || j.worker_id;
+
+              const freshProof = resolveSupabaseStorageUrl(
+                st?.application_submitted_screenshot_url
+                || st?.screenshot_path
+                || f?.application_submitted_screenshot_url
+                || f?.applied_screenshot
+                || null
+              );
+
+              if (effectiveStatus !== j.status || freshProof !== j.application_submitted_screenshot_url || (st && st.id !== j.taskId)) {
+                changed = true;
+                return {
+                  ...j,
+                  taskId: st?.id || j.taskId,
+                  task_id: st?.id || j.task_id,
+                  status: effectiveStatus,
+                  worker_id: effectiveWorker,
+                  application_submitted_screenshot_url: freshProof,
+                  applied_screenshot: freshProof,
+                  screenshot_url: freshProof,
+                };
               }
               return j;
             });
@@ -425,9 +636,10 @@ export default function CADashboard() {
           });
         }
 
-        // 2. Reflect latest active task progress
+        // 2. Candidate-level console stepper (strictly isolated to top URL input console)
+        // A5: batch_job_queue progress only updates top URL stepper; NEVER modifies clientJobs or individual applications.
         const task = queueRes.data?.[0];
-        if (task) {
+        if (task && jobUrl) {
           if (task.status === 'reached_review' || task.status === 'pre_resolved') {
             setApplyStep(3);
           } else if (task.status === 'submitted') {
@@ -599,7 +811,7 @@ export default function CADashboard() {
         </div>
         <div className="candidate-quick-pills" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
           <span className="quick-label" style={{ fontWeight: 'bold', color: '#94a3b8' }}>
-            ALLOTTED CLIENTS ({candidateList.length}) &bull; YESTERDAY'S WORK DATA ({yesterdayDate}):
+            ALLOTTED CLIENTS ({candidateList.length}) &bull; WORK DATA ({yesterdayDate} &bull; {workdayInfo.label}):
           </span>
           {candidateList.length > 0 ? (
             candidateList.map((c) => {
@@ -949,13 +1161,14 @@ export default function CADashboard() {
                 {clientJobs.length > 0 ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     {clientJobs.map((j, idx) => {
-                      const isSub = j.status === 'submitted';
+                      const isSub = j.status === 'submitted' || j.status === 'completed';
                       const isApplying = j.status === 'applying' || j.status === 'in_flight' || j.status === 'in_progress';
                       const isQ = j.status === 'queued' || j.status === 'queued_for_submission' || j.status === 'in_queue' || j.status === 'approved_for_submission';
+                      const isFailed = j.status === 'failed' || j.status === 'error';
                       const hasMissing = (j.unanswered_count && j.unanswered_count > 0) || j.status === 'needs_answers';
+                      const isReady = j.status === 'ready_for_review' || (!isSub && !isApplying && !isQ && !isFailed && !hasMissing);
                       const isSelected = activeTask?.id === j.id;
-                      const isSubmitted = j.status === 'submitted';
-                      const cardScreenshot = (isSubmitted || j.application_submitted_screenshot_url || j.applied_screenshot)
+                      const cardScreenshot = isSub
                         ? (j.application_submitted_screenshot_url || j.applied_screenshot || j.screenshot_url || null)
                         : null;
 
@@ -973,17 +1186,22 @@ export default function CADashboard() {
                         badgeBg = 'rgba(168, 85, 247, 0.15)';
                         badgeColor = '#c084fc';
                         badgeBorder = 'rgba(168, 85, 247, 0.35)';
-                        badgeText = 'APPLYING';
-                      } else if (hasMissing) {
-                        badgeBg = 'rgba(245, 158, 11, 0.15)';
-                        badgeColor = '#fbbf24';
-                        badgeBorder = 'rgba(245, 158, 11, 0.35)';
-                        badgeText = `NEEDS ANSWERS (${j.unanswered_count || 1})`;
+                        badgeText = j.worker_id ? `APPLYING • ${j.worker_id.replace('submitting_worker_', 'WORKER ')}` : 'APPLYING';
                       } else if (isQ) {
                         badgeBg = 'rgba(245, 158, 11, 0.15)';
                         badgeColor = '#f59e0b';
                         badgeBorder = 'rgba(245, 158, 11, 0.3)';
                         badgeText = 'IN QUEUE';
+                      } else if (isFailed) {
+                        badgeBg = 'rgba(239, 68, 68, 0.15)';
+                        badgeColor = '#f87171';
+                        badgeBorder = 'rgba(239, 68, 68, 0.35)';
+                        badgeText = 'FAILED';
+                      } else if (hasMissing) {
+                        badgeBg = 'rgba(245, 158, 11, 0.15)';
+                        badgeColor = '#fbbf24';
+                        badgeBorder = 'rgba(245, 158, 11, 0.35)';
+                        badgeText = `NEEDS ANSWERS (${j.unanswered_count || 1})`;
                       }
 
                       return (
@@ -1027,6 +1245,32 @@ export default function CADashboard() {
                               }}>
                                 {badgeText}
                               </span>
+
+                              {/* Quick Review & Submit Button: ONLY when ready_for_review and fully answered */}
+                              {isReady && !hasMissing && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleCardQuickSubmit(e, j)}
+                                  style={{
+                                    fontSize: '0.68rem',
+                                    fontWeight: 700,
+                                    padding: '2px 8px',
+                                    borderRadius: '4px',
+                                    background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+                                    color: '#ffffff',
+                                    border: '1px solid #38bdf8',
+                                    cursor: 'pointer',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '4px',
+                                    boxShadow: '0 2px 6px rgba(2, 132, 199, 0.35)',
+                                  }}
+                                  title="Submit exactly this single application to worker pool"
+                                >
+                                  <Sparkles size={11} />
+                                  <span>Review & Submit</span>
+                                </button>
+                              )}
 
                               {/* Authentic Confirmation Screenshot Button: Enabled ONLY after actual submission */}
                               {cardScreenshot ? (

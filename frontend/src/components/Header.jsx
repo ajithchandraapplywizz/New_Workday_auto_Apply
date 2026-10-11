@@ -1,6 +1,6 @@
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
-import { getPreviousWorkdayDateStr } from '../utils/dateUtils';
+import { getPreviousWorkdayDateStr, getWorkdayInfo } from '../utils/dateUtils';
 
 export default function Header({ activeTab, onTabChange, operatorView, onOperatorViewChange }) {
   const { user, switchRole, logout, date, setDate, timeframe, setTimeframe } = useAuth();
@@ -88,10 +88,10 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
 
           {/* Date Picker: Hidden for CA/Operator and Manager, locked to Yesterday's work history data */}
           {(user?.role === 'ca' || user?.role === 'operator' || user?.role === 'manager') ? (
-            <div className="control-date-box" title="Candidate and team work data locked to yesterday's work history data">
+            <div className="control-date-box" title="Candidate and team work data locked to previous working day's work history">
               <span className="control-label-micro">WORK DATA DATE</span>
               <span style={{ fontSize: '0.78rem', fontWeight: 800, color: '#38bdf8', padding: '2px 6px', letterSpacing: '0.02em' }}>
-                {getPreviousWorkdayDateStr()} (Yesterday)
+                {getWorkdayInfo().dateStr} ({getWorkdayInfo().label})
               </span>
             </div>
           ) : (

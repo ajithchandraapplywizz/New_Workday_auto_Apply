@@ -1102,10 +1102,13 @@ export default function DeveloperDashboard() {
                   {/* Worker Sub-Filter */}
                   <div style={{ display: 'flex', gap: '3px' }}>
                     {[
-                      { id: 'all', label: 'All (1-3)' },
+                      { id: 'all', label: 'All (1-6)' },
                       { id: 'submitting_worker_1', label: 'W1' },
                       { id: 'submitting_worker_2', label: 'W2' },
                       { id: 'submitting_worker_3', label: 'W3' },
+                      { id: 'submitting_worker_4', label: 'W4' },
+                      { id: 'submitting_worker_5', label: 'W5' },
+                      { id: 'submitting_worker_6', label: 'W6' },
                     ].map((w) => (
                       <button
                         key={w.id}

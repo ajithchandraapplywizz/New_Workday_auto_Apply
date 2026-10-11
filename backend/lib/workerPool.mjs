@@ -24,8 +24,10 @@ import { resolveCompanyEmail } from './applyWizzClient.mjs';
 import { checkAndPreResolveJobForClient, recordDiscoveredJobForm, bulkPreResolveForJobUrl } from './jobFormCache.mjs';
 import { upsertSupabaseApplication, updateQueueTaskStatus, leaseNextQueueTask, leaseSpecificQueueTask, fetchPendingTasksForActiveCAs, getBatchQueueStats, updateWorkerStatus, getActiveCaCandidateIds, getTotalApplicationCountForCandidates, uploadStorageScreenshot, getActiveOperators, logAutomationTrace } from './supabaseClient.mjs';
 import { isGlobalStopRequested, setGlobalStop, registerActiveBrowser, unregisterActiveBrowser } from './browserLifecycle.mjs';
+import { createClient } from '@supabase/supabase-js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const DEAD_JOB_URLS = new Set();
 
@@ -1041,14 +1043,24 @@ export async function executeWorkerTask({
 
     if (status === 'submitted') {
       try {
-        const { completeSubmittedTask } = await import('./supabaseClient.mjs');
-        await completeSubmittedTask({
-          applywizzId,
-          jobUrl,
-          screenshotUrl: completionShotUrl,
-          workerId,
-        });
-      } catch {}
+        const completionTimestamp = new Date().toISOString();
+        const distUpdate = {
+          status: 'submitted',
+          application_submitted_screenshot_url: completionShotUrl,
+          worker_id: workerId,
+          updated_at: completionTimestamp,
+        };
+        if (task.id) {
+          const { error: dErr } = await supabase.from('job_distributions').update(distUpdate).eq('id', task.id);
+          if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions by id:`, dErr.message);
+        } else {
+          const { error: dErr } = await supabase.from('job_distributions').update(distUpdate).eq('applywizz_id', applywizzId).eq('job_url', jobUrl);
+          if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions by applywizz_id/url:`, dErr.message);
+        }
+        console.log(`   ✅ [${workerId}] job_distributions record updated to 'submitted' with proof screenshot: ${completionShotUrl || 'saved'}`);
+      } catch (err) {
+        console.warn(`   ⚠️ [${workerId}] Error writing submitted status to job_distributions:`, err.message);
+      }
       appLog(16, `Playwright: Application submitted successfully! Verified confirmation screen ('Alright... Application Submitted'). Screenshot proof saved to Supabase Storage: ${completionShotUrl || 'Supabase'}`);
     } else if (status === 'reached-review' || status === 'reached_review') {
       const isClusterBlueprint = Boolean(options.isClusterBlueprint || options.skipJobDistribution);
@@ -1728,8 +1740,8 @@ export async function executeSingleTargetedSubmission({
   // 1. Fetch task details from job_distributions
   const { createClient } = await import('@supabase/supabase-js');
   const { loadLocalEnvOnce } = await import('./supabaseClient.mjs');
-  const env = loadLocalEnvOnce();
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  loadLocalEnvOnce();
+  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
@@ -1772,6 +1784,13 @@ export async function executeSingleTargetedSubmission({
       reviewed_at: now,
       updated_at: now,
     }).eq('id', distributionId).catch(() => {});
+
+    await supabase.from('submission_tasks').update({
+      status: 'applying',
+      worker_id: workerId,
+      started_at: now,
+      updated_at: now,
+    }).eq('distribution_id', distributionId).catch(() => {});
   } else {
     await supabase.from('job_distributions').update({
       status: 'applying',
@@ -1827,23 +1846,21 @@ export async function executeSingleTargetedSubmission({
       updated_at: completionTimestamp,
     };
     if (distributionId) {
-      await supabase.from('job_distributions').update(updateBody).eq('id', distributionId).catch(() => {});
-    } else {
-      await supabase.from('job_distributions').update(updateBody).eq('applywizz_id', finalApplywizzId).eq('job_url', finalJobUrl).catch(() => {});
-    }
+      const { error: dErr } = await supabase.from('job_distributions').update(updateBody).eq('id', distributionId);
+      if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions:`, dErr.message);
+      else console.log(`   ✅ [${workerId}] job_distributions record #${distributionId} updated to 'submitted' with proof: ${finalProofShot || 'saved'}`);
 
-    // Sync to applications table for Admin, Developer, and Manager dashboards
-    const appRow = {
-      applywizz_id: finalApplywizzId,
-      job_url: finalJobUrl,
-      company: company || 'Workday Tenant',
-      role_title: roleTitle || 'Workday Position',
-      status: 'submitted',
-      screenshot_url: finalProofShot,
-      applied_screenshot: finalProofShot,
-      updated_at: completionTimestamp,
-    };
-    await supabase.from('applications').upsert(appRow, { onConflict: 'applywizz_id,job_url' }).catch(() => {});
+      await supabase.from('submission_tasks').update({
+        status: 'submitted',
+        application_submitted_screenshot_url: finalProofShot,
+        completed_at: completionTimestamp,
+        updated_at: completionTimestamp,
+      }).eq('distribution_id', distributionId).catch(() => {});
+    } else {
+      const { error: dErr } = await supabase.from('job_distributions').update(updateBody).eq('applywizz_id', finalApplywizzId).eq('job_url', finalJobUrl);
+      if (dErr) console.warn(`   ⚠️ [${workerId}] Warning updating job_distributions:`, dErr.message);
+      else console.log(`   ✅ [${workerId}] job_distributions record updated to 'submitted' with proof: ${finalProofShot || 'saved'}`);
+    }
   } else {
     console.log(`\n❌ [${workerId}] Targeted submission stopped (${result?.failureReason || result?.status || 'Failed'}).`);
     const updateBody = {
@@ -1854,21 +1871,15 @@ export async function executeSingleTargetedSubmission({
     };
     if (distributionId) {
       await supabase.from('job_distributions').update(updateBody).eq('id', distributionId).catch(() => {});
+      await supabase.from('submission_tasks').update({
+        status: 'failed',
+        error_message: result?.failureReason || result?.error || 'Submission failed',
+        completed_at: completionTimestamp,
+        updated_at: completionTimestamp,
+      }).eq('distribution_id', distributionId).catch(() => {});
     } else {
       await supabase.from('job_distributions').update(updateBody).eq('applywizz_id', finalApplywizzId).eq('job_url', finalJobUrl).catch(() => {});
     }
-
-    // Sync failure to applications table
-    const appRow = {
-      applywizz_id: finalApplywizzId,
-      job_url: finalJobUrl,
-      company: company || 'Workday Tenant',
-      role_title: roleTitle || 'Workday Position',
-      status: 'failed',
-      failure_reason: result?.failureReason || result?.error || 'Submission failed',
-      updated_at: completionTimestamp,
-    };
-    await supabase.from('applications').upsert(appRow, { onConflict: 'applywizz_id,job_url' }).catch(() => {});
   }
 
   // 5. Release worker back to idle
@@ -1878,6 +1889,30 @@ export async function executeSingleTargetedSubmission({
     current_application_id: null,
     bot_name: `Submitting Worker ${workerId.slice(-1)}`,
   }).catch(() => {});
+
+  // 6. FIFO Next-in-Queue Auto Dispatcher: Pick next queued task
+  try {
+    const { data: nextQueue } = await supabase
+      .from('submission_tasks')
+      .select('*')
+      .eq('status', 'queued')
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (nextQueue && nextQueue.length > 0) {
+      const nextItem = nextQueue[0];
+      console.log(`\n⚡ [FIFO QUEUE] Next queued application #${nextItem.distribution_id} found! Triggering ${workerId}...`);
+      executeSingleTargetedSubmission({
+        distributionId: nextItem.distribution_id,
+        applywizzId: nextItem.applywizz_id,
+        jobUrl: nextItem.job_url,
+        workerId,
+        headless,
+      }).catch((qErr) => {
+        console.error(`❌ [FIFO QUEUE ERROR]:`, qErr?.message);
+      });
+    }
+  } catch {}
 
   return {
     success: isSubmitted,

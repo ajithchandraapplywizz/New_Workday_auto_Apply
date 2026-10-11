@@ -83,7 +83,7 @@ async function resetAllWorkersIdle() {
       current_application_id: null,
       stage,
       bot_name: meta,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
@@ -98,7 +98,7 @@ async function syncBotControlState(patch = {}) {
     stop_requested: isGlobalStopRequested(),
     active_worker_count: isPoolRunning ? 3 : 0,
     ...patch,
-  }).catch(() => {});
+  }).catch(() => { });
 }
 
 /**
@@ -113,10 +113,10 @@ export async function stopAutonomousPool() {
   setGlobalStop(true);
 
   // Terminate any active Playwright browser windows in <500ms
-  await abortAllActiveBrowsers().catch(() => {});
+  await abortAllActiveBrowsers().catch(() => { });
 
   // Set all 9 workers to idle in worker_status
-  await resetAllWorkersIdle().catch(() => {});
+  await resetAllWorkersIdle().catch(() => { });
 
   // Update bot_control state
   await syncBotControlState({
@@ -133,7 +133,7 @@ export async function stopAutonomousPool() {
     state: 'idle',
     syncedDate: new Date().toISOString().slice(0, 10),
     workersAssigned: 9,
-  }).catch(() => {});
+  }).catch(() => { });
 
   console.log(`✅ [DAEMON] Stop complete. All 9 workers set to idle and active browsers closed.`);
   return { success: true, message: 'All 9 workers stopped and reset to idle.' };
@@ -165,7 +165,7 @@ async function runStage1Scanning() {
 
   // Ensure scanning workers reset to idle
   for (const wId of PIPELINE_CONFIG.scanWorkerIds) {
-    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'scanning' }).catch(() => {});
+    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'scanning' }).catch(() => { });
   }
 }
 
@@ -188,7 +188,7 @@ async function runStage2Resolving() {
 
   // Ensure resolving workers reset to idle
   for (const wId of PIPELINE_CONFIG.resolveWorkerIds) {
-    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'resolving' }).catch(() => {});
+    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'resolving' }).catch(() => { });
   }
 }
 
@@ -197,28 +197,44 @@ async function runStage2Resolving() {
  */
 async function runStage3Submissions() {
   currentStage = 'submitting';
+  console.log(`\n🚀 [DAEMON] Checking for CA-approved applications in job_distributions...`);
+
+  // Strictly submit ONLY applications that a Career Associate has explicitly approved
+  const { data: approvedRows } = await supabase
+    .from('job_distributions')
+    .select('id, applywizz_id, job_url, status')
+    .in('status', ['approved_for_submission', 'queued'])
+    .limit(20);
+
+  if (!approvedRows || approvedRows.length === 0) {
+    console.log(`ℹ️ [DAEMON] 0 applications with status 'approved_for_submission'. No batch submissions will run.`);
+    return;
+  }
+
   await syncBotControlState({
     stage: 'submitting',
     is_running: true,
-    current_action: 'Submitting approved applications with Playwright verification',
-    active_worker_count: 3,
+    current_action: `Submitting ${approvedRows.length} CA-approved application(s)`,
+    active_worker_count: Math.min(approvedRows.length, 3),
   });
 
-  console.log(`\n🚀 [DAEMON] Starting Stage 3: Submitting approved applications with 3 submitting workers (submitting_worker_1..3)...`);
+  console.log(`\n🚀 [DAEMON] Submitting ${approvedRows.length} CA-approved application(s)...`);
+  const { executeSingleTargetedSubmission } = await import('../lib/workerPool.mjs');
+  for (let i = 0; i < approvedRows.length; i++) {
+    const app = approvedRows[i];
+    const workerId = `submitting_worker_${(i % 3) + 1}`;
+    await executeSingleTargetedSubmission({
+      distributionId: app.id,
+      applywizzId: app.applywizz_id,
+      jobUrl: app.job_url,
+      workerId,
+      headless: HEADLESS,
+    }).catch(console.error);
+  }
 
-  const { runQueueWorkerPool } = await import('../lib/workerPool.mjs');
-  await runQueueWorkerPool({
-    concurrency: 3,
-    headless: HEADLESS,
-    confirmSubmit: true,
-    dryRun: false,
-    defaultPassword: process.env.WORKDAY_PASSWORD || 'Applywizz@2026789',
-    activeCaOnly: false,
-  });
-
-  // Ensure submitting workers reset to idle
+  // Reset submitting workers back to idle
   for (const wId of PIPELINE_CONFIG.submitWorkerIds) {
-    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'submitting' }).catch(() => {});
+    await updateWorkerStatus(wId, { state: 'idle', current_application_id: null, stage: 'submitting' }).catch(() => { });
   }
 }
 
@@ -267,7 +283,7 @@ export async function runSequentialPipeline() {
   } finally {
     isPoolRunning = false;
     currentStage = 'idle';
-    await resetAllWorkersIdle().catch(() => {});
+    await resetAllWorkersIdle().catch(() => { });
     await syncBotControlState({
       stage: 'idle',
       is_running: false,
@@ -330,7 +346,7 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) buffers.push(chunk);
       const rawText = Buffer.concat(buffers).toString();
       if (rawText) body = JSON.parse(rawText);
-    } catch {}
+    } catch { }
   }
 
   // 3. Stop Webhook
@@ -359,6 +375,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     console.log(`\n⚡ [DAEMON WEBHOOK] Start signal received! Launching sequential 9-worker pipeline...`);
+    isPoolRunning = true;
+    currentStage = 'scanning';
+    syncBotControlState({ stage: 'scanning', is_running: true, stop_requested: false }).catch(() => { });
     // Run asynchronously so webhook response is instant (<100ms)
     runSequentialPipeline().catch(console.error);
 
@@ -372,43 +391,148 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 5a. Targeted Single-Item Submission Webhook (Zero Batch Log Pollution)
+  // 4b. CA Targeted Click Endpoint: POST /api/submissions/:taskId/submit (or /api/bot/submissions/:taskId/submit)
+  const submitTaskMatch = pathname.match(/^\/api\/(?:bot\/)?submissions\/([a-zA-Z0-9_-]+)\/submit\/?$/);
+  if (req.method === 'POST' && submitTaskMatch) {
+    const taskId = submitTaskMatch[1];
+    const ca = body.ca || body.caEmail || body.reviewed_by || req.headers['x-ca-email'] || 'Career Associate';
+    console.log(`\n⚡ [DAEMON] CA Click received for task #${taskId} by CA '${ca}'`);
+    const { queueSubmissionTask } = await import('../lib/submissionTaskService.mjs');
+    const result = await queueSubmissionTask({ taskId, ca });
+    if (result?.success) {
+      setImmediate(() => dispatchQueuedSubmissions().catch(() => { }));
+    }
+    res.writeHead(result.statusCode || 200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  // 5a. Targeted Single-Item Submission Webhook (Disabled behind guard — must use POST /api/submissions/:taskId/submit)
   if (pathname === '/api/bot/submit-single' || (pathname === '/api/bot/submit' && (body.distributionId || body.applywizzId))) {
+    console.warn(`[GUARD] Legacy submission webhook attempted for ${body.distributionId || body.applywizzId} on ${pathname}. Blocked.`);
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: false,
+      error: 'Legacy submission webhook is disabled. Submissions must be queued via POST /api/submissions/:taskId/submit.',
+    }));
+    return;
+  }
+
+  if (false && (pathname === '/api/bot/submit-single' || (pathname === '/api/bot/submit' && (body.distributionId || body.applywizzId)))) {
     const { distributionId, applywizzId, jobUrl } = body;
     console.log(`\n⚡ [DAEMON WEBHOOK] Targeted submit received for ${applywizzId || distributionId} at ${jobUrl || 'URL'}`);
 
-    // Pick an available submitting worker (1, 2, or 3)
-    let chosenWorkerId = PIPELINE_CONFIG.submitWorkerIds[0] || 'submitting_worker_1';
+    const nowIso = new Date().toISOString();
+    const cleanId = (applywizzId || '').toUpperCase().trim();
+
+    // Check availability across the 3 submitting workers (submitting_worker_1, 2, 3)
+    const submitWorkerIds = PIPELINE_CONFIG.submitWorkerIds || ['submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3'];
+    let chosenWorkerId = null;
+
     try {
-      const { getWorkerStatuses } = await import('../lib/supabaseClient.mjs');
-      const activeWorkers = await getWorkerStatuses().catch(() => []);
-      const idleSubmitter = PIPELINE_CONFIG.submitWorkerIds.find((wid) => {
-        const found = activeWorkers.find((w) => w.worker_id === wid);
-        return !found || found.state === 'idle';
+      const { data: activeWorkers } = await supabase.from('worker_status').select('*').in('worker_id', submitWorkerIds);
+      const idleWorker = submitWorkerIds.find((wid) => {
+        const row = (activeWorkers || []).find((w) => w.worker_id === wid);
+        return !row || row.state === 'idle';
       });
-      if (idleSubmitter) chosenWorkerId = idleSubmitter;
-    } catch {}
+      if (idleWorker) {
+        chosenWorkerId = idleWorker;
+      }
+    } catch (wErr) {
+      chosenWorkerId = submitWorkerIds[0];
+    }
 
-    const { executeSingleTargetedSubmission } = await import('../lib/workerPool.mjs');
-    // Dispatch in background so HTTP response returns in <100ms
-    executeSingleTargetedSubmission({
-      distributionId,
-      applywizzId,
-      jobUrl,
-      workerId: chosenWorkerId,
-      headless: HEADLESS,
-    }).catch((err) => {
-      console.error(`❌ [TARGETED SUBMISSION ERROR]:`, err?.message);
-    });
+    if (chosenWorkerId) {
+      // 1. Immediately mark worker as in_flight so UI & database reflect state in <50ms
+      await updateWorkerStatus(chosenWorkerId, {
+        state: 'in_flight',
+        stage: 'submitting',
+        current_application_id: distributionId || `${cleanId}:${jobUrl}`,
+        bot_name: `Submitting Worker ${chosenWorkerId.slice(-1)}`,
+        updated_at: nowIso,
+      }).catch(() => { });
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      message: `Targeted submission launched for ${applywizzId || 'candidate'} on ${chosenWorkerId}`,
-      workerId: chosenWorkerId,
-      distributionId,
-    }));
-    return;
+      // 2. Mark job_distributions as 'applying'
+      const applyUpdate = {
+        status: 'applying',
+        worker_id: chosenWorkerId,
+        reviewed_by: 'Career Associate',
+        reviewed_at: nowIso,
+        updated_at: nowIso,
+      };
+      if (distributionId) {
+        await supabase.from('job_distributions').update(applyUpdate).eq('id', distributionId).catch(() => { });
+      } else if (cleanId && jobUrl) {
+        await supabase.from('job_distributions').update(applyUpdate).eq('applywizz_id', cleanId).eq('job_url', jobUrl).catch(() => { });
+      }
+
+      // 3. Upsert into submission_tasks table with status 'applying'
+      if (distributionId) {
+        await supabase.from('submission_tasks').upsert({
+          distribution_id: distributionId,
+          applywizz_id: cleanId,
+          job_url: jobUrl,
+          status: 'applying',
+          worker_id: chosenWorkerId,
+          reviewed_by: 'Career Associate',
+          started_at: nowIso,
+          updated_at: nowIso,
+        }, { onConflict: 'distribution_id' }).catch(() => { });
+      }
+
+      const { executeSingleTargetedSubmission } = await import('../lib/workerPool.mjs');
+      // Dispatch in background
+      executeSingleTargetedSubmission({
+        distributionId,
+        applywizzId: cleanId,
+        jobUrl,
+        workerId: chosenWorkerId,
+        headless: HEADLESS,
+      }).catch((err) => {
+        console.error(`❌ [TARGETED SUBMISSION ERROR]:`, err?.message);
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        status: 'applying',
+        message: `Assigned to ${chosenWorkerId}. Workday submission in progress.`,
+        workerId: chosenWorkerId,
+        distributionId,
+      }));
+      return;
+    } else {
+      // All 3 submitting workers are currently in_flight -> Queue this application!
+      console.log(`\n⏳ [DAEMON WEBHOOK] All 3 submitting workers are busy. Queuing application for ${cleanId}...`);
+
+      if (distributionId) {
+        await supabase.from('job_distributions').update({
+          status: 'queued',
+          reviewed_by: 'Career Associate',
+          reviewed_at: nowIso,
+          updated_at: nowIso,
+        }).eq('id', distributionId).catch(() => { });
+
+        await supabase.from('submission_tasks').upsert({
+          distribution_id: distributionId,
+          applywizz_id: cleanId,
+          job_url: jobUrl,
+          status: 'queued',
+          reviewed_by: 'Career Associate',
+          created_at: nowIso,
+          updated_at: nowIso,
+        }, { onConflict: 'distribution_id' }).catch(() => { });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        status: 'queued',
+        message: 'All 3 submitting workers are busy. Application successfully queued and will auto-submit as soon as a worker is free.',
+        distributionId,
+      }));
+      return;
+    }
   }
 
   // 5b. Batch Submit Approved Applications Webhook (Stage 3 Pool)
@@ -430,7 +554,7 @@ const server = http.createServer(async (req, res) => {
     runStage3Submissions().finally(() => {
       isPoolRunning = false;
       currentStage = 'idle';
-      resetAllWorkersIdle().catch(() => {});
+      resetAllWorkersIdle().catch(() => { });
       syncBotControlState({
         stage: 'idle',
         is_running: false,
@@ -452,13 +576,54 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Endpoint not found' }));
 });
 
+// ── Autonomous 6-Worker Parallel Submission Dispatcher ──
+const activeSubmittingWorkers = new Set();
+
+export async function dispatchQueuedSubmissions() {
+  if (isGlobalStopRequested() || isPoolPaused) return;
+  try {
+    const { SUBMISSION_WORKER_IDS, claimNextTask, processClaimedTask } = await import('../lib/submissionWorkerPool.mjs');
+
+    for (const workerId of SUBMISSION_WORKER_IDS) {
+      if (activeSubmittingWorkers.has(workerId)) continue;
+      if (isGlobalStopRequested() || isPoolPaused) break;
+
+      const claimedTask = await claimNextTask(workerId);
+      if (claimedTask) {
+        activeSubmittingWorkers.add(workerId);
+        console.log(`\n🚀 [6-WORKER DISPATCHER] ${workerId} atomically claimed task #${claimedTask.id} (${claimedTask.applywizz_id} @ ${claimedTask.company || 'Workday'})`);
+
+        // Process asynchronously so all 6 workers run in parallel!
+        processClaimedTask({
+          task: claimedTask,
+          workerId,
+          headless: HEADLESS,
+        })
+          .then((res) => {
+            console.log(`✅ [6-WORKER DISPATCHER] ${workerId} finished task #${claimedTask.id} with status: ${res?.status || 'done'}`);
+          })
+          .catch((err) => {
+            console.error(`❌ [6-WORKER DISPATCHER] ${workerId} error on task #${claimedTask.id}:`, err?.message || err);
+          })
+          .finally(() => {
+            activeSubmittingWorkers.delete(workerId);
+            // Immediately attempt next task for this newly free worker
+            setImmediate(() => dispatchQueuedSubmissions().catch(() => { }));
+          });
+      }
+    }
+  } catch (err) {
+    console.warn(`[6-WORKER DISPATCHER] Error in cycle:`, err?.message);
+  }
+}
+
 // Startup initialization
 async function initOnStartup() {
   console.log(`\n${'═'.repeat(72)}`);
-  console.log(`  AUTONOMOUS WORKDAY PIPELINE DAEMON — 9-WORKER WEBHOOK ENGINE`);
+  console.log(`  AUTONOMOUS WORKDAY PIPELINE DAEMON — 12-WORKER PARALLEL ENGINE`);
   console.log(`  Scanning (3):   scanning_worker_1, scanning_worker_2, scanning_worker_3`);
   console.log(`  Resolving (3):  resolving_worker_1, resolving_worker_2, resolving_worker_3`);
-  console.log(`  Submitting (3): submitting_worker_1, submitting_worker_2, submitting_worker_3`);
+  console.log(`  Submitting (6): submitting_worker_1..6 (PARALLEL EXECUTION POOL)`);
   console.log(`  Mode: ${HEADLESS ? 'HEADLESS' : 'HEADFUL'} | Webhook Port: ${PORT}`);
   console.log(`${'═'.repeat(72)}\n`);
 
@@ -466,7 +631,7 @@ async function initOnStartup() {
     await ensureCanonicalWorkers();
     await resetAllWorkersIdle();
     await syncBotControlState({ stage: 'idle', is_running: false, active_worker_count: 0 });
-    console.log(`[DAEMON] worker_status table initialized: strictly 9 canonical rows set to idle.`);
+    console.log(`[DAEMON] worker_status table initialized: strictly canonical rows set to idle.`);
   } catch (err) {
     console.warn(`[DAEMON] Startup note:`, err.message);
   }
@@ -497,21 +662,6 @@ async function initOnStartup() {
           runSequentialPipeline().catch(console.error);
           return;
         }
-
-        // 3. Primary Submit Approved Applications Signal
-        if (!isPoolRunning && bc.last_action_requested === 'submit_approved') {
-          console.log(`\n⚡ [DAEMON SUPABASE TRIGGER] Detected 'submit_approved' signal in bot_control table! Launching Stage 3 Submissions...`);
-          await syncBotControlState({ last_action_requested: null, is_running: true });
-          isPoolRunning = true;
-          setGlobalStop(false);
-          runStage3Submissions().finally(() => {
-            isPoolRunning = false;
-            currentStage = 'idle';
-            resetAllWorkersIdle().catch(() => {});
-            syncBotControlState({ stage: 'idle', is_running: false, active_worker_count: 0 });
-          }).catch(console.error);
-          return;
-        }
       } else {
         if (!warnedMissingBotControl) {
           warnedMissingBotControl = true;
@@ -521,7 +671,7 @@ async function initOnStartup() {
 
       // Heartbeat: keep bot_control active while scanning or submitting
       if (isPoolRunning) {
-        await syncBotControlState({ is_running: true, stage: currentStage }).catch(() => {});
+        await syncBotControlState({ is_running: true, stage: currentStage }).catch(() => { });
       }
 
       // ── Resilient Fallback Bridge via worker_status table ──
@@ -542,59 +692,24 @@ async function initOnStartup() {
         }
       }
 
-      // ── Targeted Submission Bridge for CA Approvals (Continuous 2s Poll) ──
-      try {
-        const { data: approvedApps } = await supabase
-          .from('job_distributions')
-          .select('id, applywizz_id, job_url, status')
-          .in('status', ['approved_for_submission', 'queued'])
-          .order('updated_at', { ascending: true })
-          .limit(3);
-
-        if (approvedApps && approvedApps.length > 0) {
-          const availableSubmitters = PIPELINE_CONFIG.submitWorkerIds.filter((wid) => {
-            const found = statuses.find((w) => w.worker_id === wid);
-            return !found || found.state === 'idle';
-          });
-
-          for (const app of approvedApps) {
-            if (availableSubmitters.length > 0) {
-              const workerId = availableSubmitters.shift();
-              console.log(`\n⚡ [DAEMON AUTO-SUBMIT] Leasing ${workerId} for approved application ${app.applywizz_id} (${app.job_url})`);
-
-              // Mark applying immediately to prevent double lease
-              await supabase
-                .from('job_distributions')
-                .update({ status: 'applying', worker_id: workerId, updated_at: new Date().toISOString() })
-                .eq('id', app.id)
-                .catch(() => {});
-
-              const { executeSingleTargetedSubmission } = await import('../lib/workerPool.mjs');
-              executeSingleTargetedSubmission({
-                distributionId: app.id,
-                applywizzId: app.applywizz_id,
-                jobUrl: app.job_url,
-                workerId,
-                headless: HEADLESS,
-              }).catch((err) => {
-                console.error(`❌ [DAEMON AUTO-SUBMIT ERROR]:`, err?.message);
-              });
-            } else if (app.status === 'approved_for_submission') {
-              // All 3 submitting workers busy: mark queued
-              await supabase
-                .from('job_distributions')
-                .update({ status: 'queued', updated_at: new Date().toISOString() })
-                .eq('id', app.id)
-                .catch(() => {});
-            }
-          }
-        }
-      } catch (subErr) {
-        // Continue silently
-      }
     } catch {
       // Continue polling silently
     }
+  }, 2000);
+
+  // ── Phase 3: 10-Minute Lease Reaper Background Interval (runs every 60s) ──
+  setInterval(async () => {
+    try {
+      const { reapExpiredLeases } = await import('../lib/submissionWorkerPool.mjs');
+      await reapExpiredLeases(10);
+    } catch { }
+  }, 60_000);
+
+  // ── Autonomous 6-Worker Parallel Submission Dispatcher (runs every 2s) ──
+  setInterval(async () => {
+    try {
+      await dispatchQueuedSubmissions();
+    } catch { }
   }, 2000);
 }
 

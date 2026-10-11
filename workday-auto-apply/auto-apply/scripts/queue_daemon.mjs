@@ -367,6 +367,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 4b. CA Targeted Click Endpoint: POST /api/submissions/:taskId/submit (or /api/bot/submissions/:taskId/submit)
+  const submitTaskMatch = pathname.match(/^\/api\/(?:bot\/)?submissions\/([a-zA-Z0-9_-]+)\/submit\/?$/);
+  if (req.method === 'POST' && submitTaskMatch) {
+    const taskId = submitTaskMatch[1];
+    const ca = body.ca || body.caEmail || body.reviewed_by || req.headers['x-ca-email'] || 'Career Associate';
+    console.log(`\n⚡ [DAEMON] CA Click received for task #${taskId} by CA '${ca}'`);
+    const { queueSubmissionTask } = await import('../../../../backend/lib/submissionTaskService.mjs');
+    const result = await queueSubmissionTask({ taskId, ca });
+    res.writeHead(result.statusCode || 200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
   // 5a. Targeted Single-Item Submission Webhook (Zero Batch Log Pollution)
   if (pathname === '/api/bot/submit-single' || (pathname === '/api/bot/submit' && (body.distributionId || body.applywizzId))) {
     const { distributionId, applywizzId, jobUrl } = body;

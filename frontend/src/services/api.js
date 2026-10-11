@@ -1,4 +1,9 @@
 
+// Daemon Base URL: configurable via VITE_DAEMON_URL or VITE_BACKEND_URL (defaults to http://localhost:3001)
+export const DAEMON_BASE_URL = (typeof import.meta !== 'undefined' && (import.meta.env?.VITE_DAEMON_URL || import.meta.env?.VITE_BACKEND_URL))
+  ? String(import.meta.env.VITE_DAEMON_URL || import.meta.env.VITE_BACKEND_URL).replace(/\/+$/, '')
+  : 'http://localhost:3001';
+
 /**
  * Normalizes clumsy AWL IDs (e.g. '26828', 'awl26828', '  AWL-26828  ') -> 'AWL-26828'
  */
@@ -35,6 +40,7 @@ export function cleanCanonicalJobUrl(rawUrl) {
 }
 
 import { supabase, SUPABASE_URL } from '../config/supabase.js';
+import { getPreviousWorkdayDateStr } from '../utils/dateUtils.js';
 export { supabase, SUPABASE_URL };
 
 /**
@@ -58,11 +64,12 @@ export function resolveSupabaseStorageUrl(rawUrl) {
     } catch {}
     return `${SUPABASE_URL}/storage/v1/object/public/${trimmed}`;
   }
+  const defaultBucket = trimmed.toLowerCase().includes('submit') ? 'submitted-applications' : 'application-successes';
   try {
-    const { data } = supabase.storage.from('application-successes').getPublicUrl(trimmed);
+    const { data } = supabase.storage.from(defaultBucket).getPublicUrl(trimmed);
     if (data?.publicUrl) return data.publicUrl;
   } catch {}
-  return `${SUPABASE_URL}/storage/v1/object/public/application-successes/${trimmed}`;
+  return `${SUPABASE_URL}/storage/v1/object/public/${defaultBucket}/${trimmed}`;
 }
 
 const CA_MANAGEMENT_BASE = 'https://applywizz-ca-management.vercel.app/api/ca';
@@ -167,7 +174,7 @@ export async function fetchClients({ limit = 100, search = '' } = {}) {
  */
 export async function fetchApplications({ limit = 100, status = '', applywizzId = '' } = {}) {
   try {
-    let query = supabase.from('applications').select('*').order('updated_at', { ascending: false }).limit(limit);
+    let query = supabase.from('job_distributions').select('*').order('updated_at', { ascending: false }).limit(limit);
     if (status && status !== 'all') {
       query = query.eq('status', status);
     }
@@ -258,14 +265,13 @@ export async function fetchJobFormSchemas() {
  */
 export async function submitApplicationRecord({ applywizzId, jobUrl, company, roleTitle, status = 'submitted' }) {
   try {
-    const { data, error } = await supabase.from('applications').upsert({
+    const { data, error } = await supabase.from('job_distributions').upsert({
       applywizz_id: applywizzId,
       job_url: jobUrl,
       company: company || 'Workday Tenant',
       role_title: roleTitle || 'Software Engineer',
       status: status,
       updated_at: new Date().toISOString(),
-      submitted_at: status === 'submitted' ? new Date().toISOString() : null,
     }, { onConflict: 'applywizz_id,job_url' });
     if (error) throw error;
     return { success: true, data };
@@ -550,7 +556,7 @@ export async function fetchOperators({ status = '', managerId = '', dateStr = ''
     const [authRes, clientRes, appRes] = await Promise.all([
       supabase.from('auth_users').select('email, status, last_sign_in'),
       supabase.from('clients').select('applywizz_id, current_ca_email'),
-      supabase.from('applications').select('applywizz_id, ca_id, status'),
+      supabase.from('job_distributions').select('applywizz_id, worker_id, status'),
     ]);
 
     const authMap = new Map();
@@ -719,6 +725,9 @@ export const CANONICAL_9_WORKERS = [
   'submitting_worker_1',
   'submitting_worker_2',
   'submitting_worker_3',
+  'submitting_worker_4',
+  'submitting_worker_5',
+  'submitting_worker_6',
 ];
 
 /**
@@ -738,9 +747,7 @@ export async function fetchWorkerStatuses() {
 
     const workers = CANONICAL_9_WORKERS.map((id) => {
       const match = rows.find((r) => r.worker_id === id);
-      const last = match ? new Date(match.updated_at || 0).getTime() : 0;
-      const isFresh = last && (now - last < 5 * 60 * 1000);
-      const activeState = match?.state === 'in_flight' || match?.state === 'running';
+      const activeState = match?.state === 'in_flight' || match?.state === 'running' || match?.state === 'busy';
 
       let stage = 'scanning';
       let cluster = 'Scan';
@@ -758,7 +765,7 @@ export async function fetchWorkerStatuses() {
         name: match?.bot_name || `${cluster} Worker ${num}`,
         cluster,
         stage: match?.stage || stage,
-        state: (activeState && isFresh) ? 'in_flight' : 'idle',
+        state: activeState ? 'in_flight' : (match?.state || 'idle'),
         current_application_id: match?.current_application_id || null,
         current_step: match?.current_step || stage,
         updated_at: match?.updated_at || new Date().toISOString(),
@@ -842,7 +849,7 @@ export async function fetchApplicationsDynamic({
   limit = 200,
 } = {}) {
   try {
-    let query = supabase.from('applications').select('*').order('updated_at', { ascending: false }).limit(limit);
+    let query = supabase.from('job_distributions').select('*').order('updated_at', { ascending: false }).limit(limit);
 
     if (status && status !== 'All') {
       if (status.toLowerCase() === 'applying' || status.toLowerCase() === 'in_progress') {
@@ -1115,7 +1122,7 @@ export async function fetchApplicationsDynamic({
  */
 export async function fetchDynamicKPIMetrics({ dateStr = '', timeframe = 'day', managerId = '', caEmail = '' } = {}) {
   try {
-    let query = supabase.from('applications').select('id, status, error_category, created_at, updated_at, manager_id, ca_id');
+    let query = supabase.from('job_distributions').select('id, status, error_message, created_at, updated_at, worker_id');
 
     if (managerId && managerId !== 'All') {
       query = query.eq('manager_id', managerId);
@@ -1163,7 +1170,14 @@ export async function fetchDynamicKPIMetrics({ dateStr = '', timeframe = 'day', 
       const { data: wRows } = await supabase
         .from('worker_status')
         .select('worker_id, state, updated_at')
-        .in('worker_id', ['submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3']);
+        .in('worker_id', [
+          'submitting_worker_1',
+          'submitting_worker_2',
+          'submitting_worker_3',
+          'submitting_worker_4',
+          'submitting_worker_5',
+          'submitting_worker_6',
+        ]);
       if (wRows && Array.isArray(wRows)) {
         liveWorkersInFlight = wRows.filter((w) => {
           const last = new Date(w.updated_at || 0).getTime();
@@ -1243,64 +1257,9 @@ export async function fetchDynamicKPIMetrics({ dateStr = '', timeframe = 'day', 
  * 19. Supabase: Fetch live automation trace for an application
  */
 export async function fetchAutomationTrace(param = {}) {
-  try {
-    const applicationId = typeof param === 'string' ? param : param?.applicationId;
-    const applywizzId = typeof param === 'object' ? param?.applywizzId : null;
-    const limit = (typeof param === 'object' && param?.limit) || 100;
-
-    let logs = [];
-
-    // 1. Primary: Direct query by application_id
-    if (applicationId) {
-      const { data, error } = await supabase
-        .from('automation_trace')
-        .select('*')
-        .eq('application_id', applicationId)
-        .order('id', { ascending: false })
-        .limit(limit);
-      if (!error && data?.length) {
-        logs = data.slice().reverse();
-        return { success: true, logs, trace: logs };
-      }
-    }
-
-    // 2. Secondary: If no logs by applicationId or applicationId was null, resolve via candidate's applications
-    if (applywizzId) {
-      const { data: candApps } = await supabase
-        .from('applications')
-        .select('id')
-        .eq('applywizz_id', applywizzId)
-        .order('updated_at', { ascending: false })
-        .limit(5);
-
-      if (candApps?.length) {
-        const appIds = candApps.map((a) => a.id).filter(Boolean);
-        if (appIds.length > 0) {
-          const { data: candLogs } = await supabase
-            .from('automation_trace')
-            .select('*')
-            .in('application_id', appIds)
-            .order('id', { ascending: false })
-            .limit(limit);
-          if (candLogs?.length) {
-            logs = candLogs.slice().reverse();
-            return { success: true, logs, trace: logs };
-          }
-        }
-      }
-    }
-
-    // 3. Fallback: Recent execution trace from any active worker
-    const { data: fallback } = await supabase
-      .from('automation_trace')
-      .select('*')
-      .order('id', { ascending: false })
-      .limit(limit);
-    logs = (fallback || []).slice().reverse();
-    return { success: true, logs, trace: logs };
-  } catch (err) {
-    return { success: false, logs: [], trace: [], error: err.message };
-  }
+  // Note: legacy automation_trace and applications tables were dropped in migration 026.
+  // Return clean empty trace structure immediately to prevent 404 network console errors.
+  return { success: true, logs: [], trace: [] };
 }
 
 /**
@@ -1310,70 +1269,17 @@ export async function fetchAutomationTrace(param = {}) {
  * - Batch 3: Submitting (submitting_worker_1, 2, 3)
  */
 export async function fetchBatchWorkerLogs({ limit = 150 } = {}) {
-  try {
-    const { data, error } = await supabase
-      .from('automation_trace')
-      .select('*')
-      .order('id', { ascending: false })
-      .limit(limit * 3);
-
-    if (error) throw error;
-    const allLogs = (data || []).slice().reverse();
-
-    const scanningLogs = [];
-    const resolvingLogs = [];
-    const submittingLogs = [];
-
-    for (const log of allLogs) {
-      const msg = String(log.message || '');
-      const lower = msg.toLowerCase();
-      const step = Number(log.step_index) || 0;
-
-      // 1. Explicit worker tag classification
-      if (lower.includes('scanning_worker') || lower.includes('scanning') || lower.includes('cluster 1') || lower.includes('batch 1')) {
-        scanningLogs.push(log);
-      } else if (lower.includes('resolving_worker') || lower.includes('pre-resolving') || lower.includes('llm reasoning') || lower.includes('tier') || lower.includes('qa bank') || lower.includes('cluster 2') || lower.includes('batch 2')) {
-        resolvingLogs.push(log);
-      } else if (lower.includes('submitting_worker') || lower.includes('workday wizard') || lower.includes('submitted') || lower.includes('step 5') || lower.includes('proof') || lower.includes('cluster 3') || lower.includes('batch 3')) {
-        submittingLogs.push(log);
-      } else {
-        // 2. Step index fallback routing
-        if (step > 0 && step <= 5) {
-          scanningLogs.push(log);
-        } else if (step === 6 || step === 7) {
-          resolvingLogs.push(log);
-        } else if (step >= 8) {
-          submittingLogs.push(log);
-        } else {
-          if (lower.includes('auth') || lower.includes('gateway') || lower.includes('discovery') || lower.includes('scrape') || lower.includes('blueprint')) {
-            scanningLogs.push(log);
-          } else if (lower.includes('answer') || lower.includes('match') || lower.includes('resume')) {
-            resolvingLogs.push(log);
-          } else {
-            submittingLogs.push(log);
-          }
-        }
-      }
-    }
-
-    return {
-      success: true,
-      batches: {
-        scanning: scanningLogs,
-        resolving: resolvingLogs,
-        submitting: submittingLogs,
-      },
-      allLogs,
-    };
-  } catch (err) {
-    console.error('Failed to fetch batch worker logs:', err);
-    return {
-      success: false,
-      batches: { scanning: [], resolving: [], submitting: [] },
-      allLogs: [],
-      error: err.message,
-    };
-  }
+  // Note: legacy automation_trace table was dropped in migration 026.
+  // Return clean empty batch structure immediately to prevent 404 network console errors.
+  return {
+    success: true,
+    batches: {
+      scanning: [],
+      resolving: [],
+      submitting: [],
+    },
+    allLogs: [],
+  };
 }
 
 /**
@@ -1432,7 +1338,9 @@ export function formatClientCompanyEmail(clientName, rawEmail, dbCompanyEmail) {
  * Fetches 100% of all assigned clients across all CAs without capping at 50 records.
  */
 export async function fetchCAWorkHistoryWithFallback({ caEmail = '', dateStr = '', maxDaysBack = 21 } = {}) {
-  const cleanDateStr = formatLocalDate(dateStr) || formatLocalDate(new Date());
+  const inputDate = dateStr ? formatLocalDate(dateStr) : '';
+  // 5-Day working calendar: If no date provided, default to previous workday (Fri on Sat/Sun/Mon)
+  const cleanDateStr = inputDate || getPreviousWorkdayDateStr();
 
   try {
     // 1. Fast range query covering past 21 days to detect active dates
@@ -1446,17 +1354,26 @@ export async function fetchCAWorkHistoryWithFallback({ caEmail = '', dateStr = '
     }
 
     const rangeRes = await fetch(rangeUrl);
+    // Dynamic working day target: e.g. 10/11/12 Oct targets 09 Oct
+    const targetWorkday = getPreviousWorkdayDateStr(cleanDateStr);
     let resolvedDate = cleanDateStr;
     let isFallback = false;
 
     if (rangeRes.ok) {
       const rangeData = await rangeRes.json();
       const allRecords = rangeData.records || [];
-      const hasRequestedDate = allRecords.some((r) => r.date === cleanDateStr);
-      if (hasRequestedDate) {
+      const hasExactRequested = allRecords.some((r) => r.date === cleanDateStr);
+      const hasTargetWorkday = allRecords.some((r) => r.date === targetWorkday);
+
+      if (hasExactRequested) {
         resolvedDate = cleanDateStr;
         isFallback = false;
+      } else if (hasTargetWorkday) {
+        // Fall back to calculated previous working day (e.g. 10/11/12 Oct -> 09 Oct)
+        resolvedDate = targetWorkday;
+        isFallback = true;
       } else {
+        // Fall back to nearest available active date within past 21 days
         const activeDates = [...new Set(allRecords.map((r) => r.date))].sort().reverse();
         if (activeDates.length > 0) {
           resolvedDate = activeDates[0];
@@ -2197,7 +2114,7 @@ export async function fetchCABotAutomationStats({ caEmail = '', dateStr = '' } =
     const bounds = getISTDateBounds(dateStr || new Date(), 'day');
     const [queueRes, appsRes, workerRes] = await Promise.all([
       supabase.from('batch_job_queue').select('*').in('applywizz_id', clientIds).gte('created_at', bounds.startIso).lte('created_at', bounds.endIso),
-      supabase.from('applications').select('*').in('applywizz_id', clientIds).gte('created_at', bounds.startIso).lte('created_at', bounds.endIso),
+      supabase.from('job_distributions').select('*').in('applywizz_id', clientIds).gte('created_at', bounds.startIso).lte('created_at', bounds.endIso),
       supabase.from('worker_status').select('*'),
     ]);
 
@@ -2316,6 +2233,9 @@ export async function fetchCABotAutomationStats({ caEmail = '', dateStr = '' } =
 export async function triggerAutonomousBot() {
   try {
     const now = new Date().toISOString();
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem('workday_scanning_bot_active', 'true'); } catch {}
+    }
 
     // 1. Unpause any queue tasks that were paused by the user
     try {
@@ -2417,6 +2337,9 @@ export async function triggerAutonomousBot() {
 export async function stopAutonomousBot() {
   try {
     const now = new Date().toISOString();
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.removeItem('workday_scanning_bot_active'); } catch {}
+    }
 
     // 1. Webhook stop call to daemon (POST /api/bot/stop)
     const backendBase = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_BACKEND_URL) ? String(import.meta.env.VITE_BACKEND_URL).replace(/\/+$/, '') : '';
@@ -2504,8 +2427,8 @@ export async function triggerSubmissionStage() {
   const endpoints = [
     '/api/bot/submit',
     '/api/bot/webhook',
-    'http://localhost:3001/api/bot/submit',
-    'http://localhost:3001/api/bot/webhook',
+    `${DAEMON_BASE_URL}/api/bot/submit`,
+    `${DAEMON_BASE_URL}/api/bot/webhook`,
   ];
   for (const ep of endpoints) {
     try {
@@ -2559,11 +2482,16 @@ export async function fetchBotDaemonStatus() {
     const workers = workersRes.data || [];
     const botControl = controlRes?.data || null;
 
-    // Any worker in_flight or busy indicates active background running
-    const hasActiveWorkers = workers.some((w) => w.state === 'in_flight' || w.state === 'busy');
+    // Check if scanning was triggered in this browser session
+    const localScanningActive = typeof window !== 'undefined' && window.localStorage?.getItem('workday_scanning_bot_active') === 'true';
+    const wasStopped = Boolean(botControl?.stop_requested);
 
-    const isRunning = daemonApiRunning || Boolean(botControl?.is_running && !botControl?.stop_requested) || hasActiveWorkers;
-    const currentStage = daemonApiStage !== 'idle' ? daemonApiStage : (botControl?.stage || (isRunning ? 'running' : 'idle'));
+    if (wasStopped && typeof window !== 'undefined') {
+      window.localStorage?.removeItem('workday_scanning_bot_active');
+    }
+
+    const isRunning = (!wasStopped && localScanningActive) || daemonApiRunning || Boolean(botControl?.is_running && !botControl?.stop_requested) || hasActiveWorkers;
+    const currentStage = daemonApiStage !== 'idle' ? daemonApiStage : (botControl?.stage || (isRunning ? 'scanning' : 'idle'));
 
     return {
       success: true,
@@ -2635,7 +2563,7 @@ export async function fetchClientApplications(applywizzId) {
         const isSubmitted = rawStatus === 'submitted' || rawStatus === 'completed';
         // ONLY genuine confirmation screenshot from submitted-applications bucket when submitted
         const proofShot = isSubmitted
-          ? (d.application_submitted_screenshot_url || d.applied_screenshot || null)
+          ? (d.application_submitted_screenshot_url || null)
           : null;
 
         jobMap.set(key, {
@@ -2671,6 +2599,39 @@ export async function fetchClientApplications(applywizzId) {
 }
 
 /**
+ * Single-application submission by task ID (Phase 2 & Phase 5 Master Plan).
+ * One identity end to end: submission_tasks.id.
+ * CAs submit exactly ONE task through POST /api/submissions/:taskId/submit.
+ */
+export async function submitTaskByTaskId({ taskId, caEmail = '' } = {}) {
+  if (!taskId) {
+    return { success: false, error: 'taskId is required' };
+  }
+
+  try {
+    const base = DAEMON_BASE_URL || '';
+    const endpoint = base ? `${base}/api/submissions/${encodeURIComponent(taskId)}/submit` : `/api/submissions/${encodeURIComponent(taskId)}/submit`;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ca: caEmail }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { success: false, error: data.error || `HTTP ${res.status}` };
+    }
+
+    return { success: true, task: data.task };
+  } catch (err) {
+    console.error(`submitTaskByTaskId error for ${taskId}:`, err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
  * Fetch detailed form questions and AI answers for the Application Slide Drawer
  * Strips away standard personal info, isolating AI-answered questions and missing/unanswered items.
  */
@@ -2695,6 +2656,19 @@ export async function fetchApplicationFormReviewData({ applywizzId, jobUrl, dist
     const { data: distData } = await query;
     if (distData && distData.length > 0) {
       distRow = distData[0];
+    }
+
+    // 1b. Fetch submission_task row by distribution_id or task ID
+    let subTaskRow = null;
+    if (distRow?.id) {
+      try {
+        const { data: stData } = await supabase
+          .from('submission_tasks')
+          .select('*')
+          .eq('distribution_id', distRow.id)
+          .maybeSingle();
+        if (stData) subTaskRow = stData;
+      } catch {}
     }
 
     // 2. Fetch scanned_jobs for the canonical questions blueprint
@@ -2887,27 +2861,40 @@ export async function fetchApplicationFormReviewData({ applywizzId, jobUrl, dist
     if (!shot && cleanId && jobUrl) {
       try {
         const canonical = cleanCanonicalJobUrl(jobUrl);
-        const { data: appRows } = await supabase
-          .from('applications')
-          .select('screenshot_url, applied_screenshot, failure_screenshot_url')
+        const { data: subRows } = await supabase
+          .from('submission_tasks')
+          .select('application_submitted_screenshot_url, screenshot_path')
           .eq('applywizz_id', cleanId)
           .or(`job_url.eq.${encodeURIComponent(jobUrl)},job_url.eq.${encodeURIComponent(canonical)}`)
           .limit(1);
-        if (appRows && appRows.length > 0) {
-          shot = appRows[0].screenshot_url || appRows[0].applied_screenshot || appRows[0].failure_screenshot_url || null;
+        if (subRows && subRows.length > 0) {
+          shot = subRows[0].application_submitted_screenshot_url || subRows[0].screenshot_path || null;
         }
       } catch {}
     }
 
-    const resolvedShot = resolveSupabaseStorageUrl(shot);
+    const effectiveTaskId = subTaskRow?.id || null;
+    const effectiveStatus = subTaskRow?.status || distRow?.status || 'ready_for_review';
+    const effectiveWorkerId = subTaskRow?.worker_id || distRow?.worker_id || null;
+    const isSubmittedState = effectiveStatus === 'submitted' || effectiveStatus === 'completed';
+
+    const proofScreenshot = isSubmittedState
+      ? (subTaskRow?.application_submitted_screenshot_url || distRow?.application_submitted_screenshot_url || shot)
+      : null;
+
+    const resolvedShot = resolveSupabaseStorageUrl(proofScreenshot);
 
     const appObj = {
       id: distRow?.id || null,
+      distributionId: distRow?.id || null,
+      taskId: effectiveTaskId,
+      task_id: effectiveTaskId,
       applywizzId: cleanId,
       jobUrl: jobUrl || distRow?.job_url,
       company: distRow?.company || scannedBlueprint?.company || 'Workday Employer',
       roleTitle: distRow?.role_title || scannedBlueprint?.role_title || 'Workday Role',
-      status: distRow?.status || 'ready_for_review',
+      status: effectiveStatus,
+      worker_id: effectiveWorkerId,
       screenshotUrl: resolvedShot,
       application_submitted_screenshot_url: resolvedShot,
       unansweredCount: unansweredFields.length,
@@ -3095,13 +3082,20 @@ export async function submitApplicationReview({
   fields = [],
   status = 'approved_for_submission',
 }) {
+  // GUARD: Legacy direct submission path disabled. Submissions must be queued via submitTaskByTaskId.
+  console.warn('[GUARD] submitApplicationReview called, but is disabled to prevent unmanaged status transitions.');
+  return {
+    success: false,
+    error: 'submitApplicationReview is disabled to prevent direct unmanaged status changes. Use submitTaskByTaskId instead.',
+  };
+
   try {
     const cleanId = String(applywizzId).trim().toUpperCase();
     const now = new Date().toISOString();
 
     // 1. Update job_distributions to applying (signals live applying in progress)
     if (distributionId) {
-      await supabase
+      const { error: dErr } = await supabase
         .from('job_distributions')
         .update({
           status: 'applying',
@@ -3110,8 +3104,18 @@ export async function submitApplicationReview({
           updated_at: now,
         })
         .eq('id', distributionId);
+      if (dErr) {
+        console.warn('Note on job_distributions update with metadata:', dErr.message);
+        await supabase
+          .from('job_distributions')
+          .update({
+            status: 'applying',
+            updated_at: now,
+          })
+          .eq('id', distributionId);
+      }
     } else if (cleanId && jobUrl) {
-      await supabase
+      const { error: dErr } = await supabase
         .from('job_distributions')
         .update({
           status: 'applying',
@@ -3121,37 +3125,35 @@ export async function submitApplicationReview({
         })
         .eq('applywizz_id', cleanId)
         .eq('job_url', jobUrl);
+      if (dErr) {
+        console.warn('Note on job_distributions update with metadata:', dErr.message);
+        await supabase
+          .from('job_distributions')
+          .update({
+            status: 'applying',
+            updated_at: now,
+          })
+          .eq('applywizz_id', cleanId)
+          .eq('job_url', jobUrl);
+      }
     }
 
-    // 2. Update batch_job_queue if present so worker pool leases it immediately
-    if (cleanId && jobUrl) {
-      await supabase
-        .from('batch_job_queue')
-        .update({
-          status: 'approved_for_submission',
-          updated_at: now,
-        })
-        .eq('applywizz_id', cleanId)
-        .eq('job_url', jobUrl);
+    // 1b. Record in dedicated submission_tasks table for 3-worker concurrency & queue
+    if (distributionId) {
+      await supabase.from('submission_tasks').upsert({
+        distribution_id: distributionId,
+        applywizz_id: cleanId,
+        job_url: jobUrl,
+        status: 'applying',
+        reviewed_by: 'Career Associate',
+        updated_at: now,
+      }, { onConflict: 'distribution_id' }).catch(() => {});
     }
 
-    // 3. Signal bot daemon in bot_control
-    try {
-      await supabase
-        .from('bot_control')
-        .upsert({
-          id: 'primary',
-          last_action_requested: 'submit_approved',
-          updated_at: now,
-        }, { onConflict: 'id' });
-    } catch { }
-
-    // 4. Send targeted HTTP trigger to background daemon to execute single Playwright submission
+    // 2. Send targeted HTTP trigger to background daemon to execute ONLY this single Playwright submission
     const submitEndpoints = [
       '/api/bot/submit-single',
       'http://localhost:3001/api/bot/submit-single',
-      '/api/bot/submit',
-      'http://localhost:3001/api/bot/submit',
     ];
     Promise.any(
       submitEndpoints.map((ep) =>
@@ -3171,9 +3173,70 @@ export async function submitApplicationReview({
 
     return {
       success: true,
-      message: 'Application approved! Dedicated submitting worker is executing Workday submission...',
+      message: 'Application approved! Dedicated submitting worker is executing Workday submission for this application...',
     };
   } catch (err) {
     return { success: false, error: err.message };
   }
 }
+
+/**
+ * Dynamic candidate application count calculation based strictly on:
+ * SELECT applywizz_id, COUNT(*) FILTER (WHERE is_fully_answered = TRUE) AS fully_answered_count
+ * FROM job_distributions GROUP BY applywizz_id ORDER BY applywizz_id;
+ *
+ * Runs dynamically for every candidate so counts are immediately visible in blue
+ * whether the CA visits that candidate or not.
+ */
+export async function fetchDynamicCandidateCounts() {
+  try {
+    // 1. Direct RPC if created
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('get_candidate_fully_answered_counts');
+    if (!rpcErr && Array.isArray(rpcData) && rpcData.length > 0) {
+      const countMap = new Map();
+      rpcData.forEach((row) => {
+        const id = (row.applywizz_id || '').trim().toUpperCase();
+        if (id) {
+          countMap.set(id, Number(row.fully_answered_count ?? row.total_job_count ?? 0));
+        }
+      });
+      return countMap;
+    }
+
+    // 2. Direct view if created
+    const { data: viewData, error: viewErr } = await supabase
+      .from('v_candidate_fully_answered_counts')
+      .select('*');
+    if (!viewErr && Array.isArray(viewData) && viewData.length > 0) {
+      const countMap = new Map();
+      viewData.forEach((row) => {
+        const id = (row.applywizz_id || '').trim().toUpperCase();
+        if (id) {
+          countMap.set(id, Number(row.fully_answered_count ?? row.total_job_count ?? 0));
+        }
+      });
+      return countMap;
+    }
+
+    // 3. Dynamic query on job_distributions
+    const { data: distData, error: distErr } = await supabase
+      .from('job_distributions')
+      .select('applywizz_id, is_fully_answered');
+    if (distErr) throw distErr;
+
+    const countMap = new Map();
+    (distData || []).forEach((row) => {
+      const id = (row.applywizz_id || '').trim().toUpperCase();
+      if (!id) return;
+      if (row.is_fully_answered === true) {
+        countMap.set(id, (countMap.get(id) || 0) + 1);
+      }
+    });
+
+    return countMap;
+  } catch (err) {
+    console.warn('Error fetching dynamic candidate counts:', err.message);
+    return new Map();
+  }
+}
+

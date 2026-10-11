@@ -30,6 +30,11 @@ export default defineConfig({
         changeOrigin: true,
         configure: handleProxyError,
       },
+      '/api/submissions': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
     },
   },
   preview: {
@@ -43,6 +48,11 @@ export default defineConfig({
         rewrite: () => '/health',
       },
       '/api/bot': {
+        target: backendUrl,
+        changeOrigin: true,
+        configure: handleProxyError,
+      },
+      '/api/submissions': {
         target: backendUrl,
         changeOrigin: true,
         configure: handleProxyError,

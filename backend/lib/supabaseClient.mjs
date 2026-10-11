@@ -467,7 +467,7 @@ export async function getApplicationForTask(applywizzId, jobUrl = '') {
     let q = `?applywizz_id=eq.${encode(applywizzId)}`;
     if (cleanUrl) q += `&job_url=eq.${encode(cleanUrl)}`;
     q += '&select=id,status,job_url,company,role_title&order=updated_at.desc&limit=1';
-    const rows = await request('applications', { query: q });
+    const rows = await request('job_distributions', { query: q });
     return rows?.[0] || null;
   } catch {
     return null;
@@ -484,7 +484,7 @@ export async function hasClientAppliedToCompany(applywizzId, companyName) {
   if (!isSupabaseConfigured() || !applywizzId || !companyName) return false;
   try {
     const cleanCompany = String(companyName).trim();
-    const res = await request('applications', {
+    const res = await request('job_distributions', {
       query: `?applywizz_id=eq.${encode(applywizzId)}&company=ilike.${encode(cleanCompany)}&select=id,status&limit=10`,
     });
     if (Array.isArray(res) && res.length > 0) {
@@ -1029,7 +1029,7 @@ export async function getTotalApplicationCountForCandidates(candidateIds = []) {
   if (!isSupabaseConfigured() || !Array.isArray(candidateIds) || candidateIds.length === 0) return 0;
   try {
     const [apps, queueTasks] = await Promise.all([
-      request('applications', {
+      request('job_distributions', {
         query: `?applywizz_id=in.(${candidateIds.map(encodeURIComponent).join(',')})&select=id,applywizz_id,job_url`,
       }),
       request('batch_job_queue', {
@@ -1277,6 +1277,7 @@ export const CANONICAL_9_WORKERS = new Set([
   'scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3',
   'resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3',
   'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
+  'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
 ]);
 
 const WORKER_STAGE_MAP = {
@@ -1289,10 +1290,13 @@ const WORKER_STAGE_MAP = {
   submitting_worker_1: { stage: 'submitting', botName: 'Submitting Worker 1' },
   submitting_worker_2: { stage: 'submitting', botName: 'Submitting Worker 2' },
   submitting_worker_3: { stage: 'submitting', botName: 'Submitting Worker 3' },
+  submitting_worker_4: { stage: 'submitting', botName: 'Submitting Worker 4' },
+  submitting_worker_5: { stage: 'submitting', botName: 'Submitting Worker 5' },
+  submitting_worker_6: { stage: 'submitting', botName: 'Submitting Worker 6' },
 };
 
 /**
- * Normalizes any worker ID alias to one of the 9 canonical database worker IDs.
+ * Normalizes any worker ID alias to one of the canonical database worker IDs.
  */
 export function normalizeCanonicalWorkerId(workerId, defaultStage = null) {
   if (!workerId) return null;
@@ -1317,6 +1321,9 @@ export function normalizeCanonicalWorkerId(workerId, defaultStage = null) {
     if (cleanId.endsWith('1')) return 'submitting_worker_1';
     if (cleanId.endsWith('2')) return 'submitting_worker_2';
     if (cleanId.endsWith('3')) return 'submitting_worker_3';
+    if (cleanId.endsWith('4')) return 'submitting_worker_4';
+    if (cleanId.endsWith('5')) return 'submitting_worker_5';
+    if (cleanId.endsWith('6')) return 'submitting_worker_6';
     return 'submitting_worker_1';
   }
 
@@ -1673,38 +1680,8 @@ export async function getActiveOperators() {
 const candidateAppTraceCache = new Map();
 
 export async function logAutomationTrace({ applicationId, applywizzId, stepIndex = 0, message = '' } = {}) {
-  if (!isSupabaseConfigured() || !message) return false;
-  try {
-    let resolvedAppId = applicationId || null;
-    if (!resolvedAppId && applywizzId) {
-      resolvedAppId = candidateAppTraceCache.get(applywizzId) || null;
-      if (!resolvedAppId) {
-        const app = await getApplicationForTask(applywizzId);
-        if (app?.id) {
-          resolvedAppId = app.id;
-          candidateAppTraceCache.set(applywizzId, resolvedAppId);
-        }
-      }
-    }
-
-    const row = {
-      step_index: stepIndex,
-      message: String(message),
-      ts: new Date().toISOString(),
-    };
-    if (resolvedAppId) {
-      row.application_id = resolvedAppId;
-    }
-
-    await request('automation_trace', {
-      method: 'POST',
-      prefer: 'return=minimal',
-      body: row,
-    }).catch(() => {});
-    return true;
-  } catch {
-    return false;
-  }
+  // automation_trace table was dropped in migration 026
+  return true;
 }
 
 // ==============================================================================
@@ -2170,15 +2147,16 @@ export async function completeSubmittedTask({
       console.log(`   ⚠️ [job_distributions] completeSubmittedTask error: ${err?.message?.slice(0, 140)}`);
     });
 
-    // Also update applications table
-    await request('applications', {
+    // Also update submission_tasks table
+    await request('submission_tasks', {
       method: 'PATCH',
       query: `?applywizz_id=eq.${encode(cleanId)}&job_url=eq.${encode(jobUrl)}`,
       prefer: 'return=minimal',
       body: {
         status: 'submitted',
-        screenshot_url: screenshotUrl || null,
-        failure_screenshot_url: screenshotUrl || null,
+        application_submitted_screenshot_url: screenshotUrl || null,
+        screenshot_path: screenshotUrl || null,
+        completed_at: now,
         updated_at: now,
       },
     }).catch(() => {});

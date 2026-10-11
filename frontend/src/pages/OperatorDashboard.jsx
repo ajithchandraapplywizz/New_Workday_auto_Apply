@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { getPreviousWorkdayDateStr } from '../utils/dateUtils';
+import { getPreviousWorkdayDateStr, getWorkdayLabel } from '../utils/dateUtils';
 import {
   fetchCAEmails,
   fetchCABotAutomationStats,
@@ -12,7 +12,9 @@ import {
   syncLiveCAData,
   formatClientCompanyEmail,
   resolveSupabaseStorageUrl,
+  fetchDynamicCandidateCounts,
 } from '../services/api';
+import { supabase } from '../config/supabase';
 import ApplicationSlideDrawer from '../components/ApplicationSlideDrawer';
 
 export default function OperatorDashboard({ operatorView = 'dashboard' }) {
@@ -72,6 +74,30 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
     clientStats: [],
   });
 
+  // Live 3 Submitting Workers (CA Bot) Status
+  const [submitWorkers, setSubmitWorkers] = useState([]);
+  useEffect(() => {
+    let isMounted = true;
+    async function pollSubmitWorkers() {
+      try {
+        const { data } = await supabase
+          .from('worker_status')
+          .select('*')
+          .in('worker_id', [
+            'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
+            'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
+          ]);
+        if (isMounted && data) setSubmitWorkers(data);
+      } catch {}
+    }
+    pollSubmitWorkers();
+    const interval = setInterval(pollSubmitWorkers, 3000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
   // Calculate total application count across all assigned candidates for this CA
   const totalCaApplications = useMemo(() => {
     return candidates.reduce((sum, c) => sum + (c.jobs_applied || 0), 0);
@@ -80,23 +106,26 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
   // Form Review Modal state
   const [showReviewModal, setShowReviewModal] = useState(false);
   const [reviewTargetApp, setReviewTargetApp] = useState(null);
+  const [selectedScreenshot, setSelectedScreenshot] = useState(null);
 
   const handleOpenReview = (app) => {
     setReviewTargetApp(app);
     setShowReviewModal(true);
   };
 
-  const handleReviewSubmitted = ({ applywizzId, jobUrl }) => {
+  const handleReviewSubmitted = ({ applywizzId, jobUrl, updatedStatus = 'applying', proofUrl = null }) => {
     setApplications((prev) =>
       prev.map((a) =>
         a.id === reviewTargetApp?.id || (a.applywizz_id === applywizzId && (a.job_url === jobUrl || a.url === jobUrl))
-          ? { ...a, status: 'in_progress' }
+          ? {
+              ...a,
+              status: updatedStatus,
+              application_submitted_screenshot_url: proofUrl || a.application_submitted_screenshot_url,
+              screenshot_url: proofUrl || a.screenshot_url,
+            }
           : a
       )
     );
-    if (selectedCandidate) {
-      handleSelectCandidate(selectedCandidate);
-    }
   };
 
   // Load candidate directory assigned to this CA on the active date (strictly yesterday / previous workday)
@@ -114,14 +143,20 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
       setIsFallbackDate(Boolean(res.isFallback));
 
       if (res.success && res.assignments?.length) {
-        const mapped = res.assignments.map((a) => ({
-          id: a.applywizz_id,
-          name: a.client_name || a.applywizz_id,
-          client_email: a.client_email,
-          jobs_applied: 0,
-          emails_submitted: 0,
-          date: targetDate,
-        }));
+        const countMap = await fetchDynamicCandidateCounts();
+
+        const mapped = res.assignments.map((a) => {
+          const cid = (a.applywizz_id || '').toUpperCase();
+          const dynamicCount = countMap.get(cid) ?? (typeof a.jobs_applied === 'number' ? a.jobs_applied : 0);
+          return {
+            id: a.applywizz_id,
+            name: a.client_name || a.applywizz_id,
+            client_email: a.client_email,
+            jobs_applied: dynamicCount,
+            emails_submitted: 0,
+            date: targetDate,
+          };
+        });
         setCandidates(mapped);
         if (mapped.length > 0) {
           handleSelectCandidate(mapped[0]);
@@ -142,6 +177,34 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
   useEffect(() => {
     loadAssignedClients();
   }, [sessionCaEmail, date]);
+
+  // Dynamic Realtime update: Whenever job_distributions entries change (new jobs arrive or answers update),
+  // immediately re-calculate counts dynamically for all clients without needing to click or refresh
+  useEffect(() => {
+    const channel = supabase
+      .channel('operator_realtime_job_distributions_counts')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'job_distributions' }, async () => {
+        try {
+          const freshCounts = await fetchDynamicCandidateCounts();
+          setCandidates((prev) =>
+            prev.map((c) => {
+              const cid = (c.id || '').toUpperCase();
+              return {
+                ...c,
+                jobs_applied: freshCounts.get(cid) ?? c.jobs_applied ?? 0,
+              };
+            })
+          );
+        } catch (e) {
+          console.warn('Realtime candidate count update note:', e.message);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   // On-demand live synchronization with CA portal
   const handleSyncLiveCA = async () => {
@@ -398,7 +461,7 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
           {/* Active Date Tag */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem' }}>
             <span style={{ color: '#94a3b8' }}>WORK DATA:</span>
-            <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>{activeWorkDate} (Yesterday)</strong>
+            <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>{activeWorkDate} ({getWorkdayLabel(activeWorkDate)})</strong>
             {isFallbackDate && (
               <span
                 title="No records found on selected date. Rolled back to nearest active working day."
@@ -598,14 +661,17 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
                       <span className="cci-awl">{c.id}</span>
                       <span style={{
                         fontSize: '0.72rem',
-                        color: selectedCandidate?.id === c.id && applications.length > 0 ? '#38bdf8' : '#94a3b8',
-                        fontWeight: selectedCandidate?.id === c.id && applications.length > 0 ? 'bold' : 'normal',
-                        background: selectedCandidate?.id === c.id && applications.length > 0 ? 'rgba(56, 189, 248, 0.15)' : 'rgba(100, 116, 139, 0.15)',
-                        padding: '2px 7px',
+                        color: (c.jobs_applied || 0) > 0 ? '#38bdf8' : '#94a3b8',
+                        fontWeight: 'bold',
+                        background: (c.jobs_applied || 0) > 0 ? 'rgba(56, 189, 248, 0.2)' : 'rgba(100, 116, 139, 0.15)',
+                        padding: '2px 8px',
                         borderRadius: '4px',
-                        border: `1px solid ${selectedCandidate?.id === c.id && applications.length > 0 ? 'rgba(56, 189, 248, 0.3)' : 'rgba(100, 116, 139, 0.25)'}`,
+                        border: (c.jobs_applied || 0) > 0 ? '1px solid rgba(56, 189, 248, 0.45)' : '1px solid rgba(100, 116, 139, 0.25)',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
                       }}>
-                        {selectedCandidate?.id === c.id ? `${applications.length} Apps` : 'Assigned'}
+                        {c.jobs_applied || 0} Apps
                       </span>
                     </div>
                   </div>
@@ -705,10 +771,48 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
 
                 {/* 2. Assigned Workday Application Queue */}
                 <div style={{ marginTop: '1.5rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '8px' }}>
                     <h3 style={{ color: '#e2e8f0', fontSize: '1.1rem', margin: 0 }}>
                       Assigned Workday Application Queue
                     </h3>
+
+                    {/* Live 6 Submitting Workers Status Strip */}
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      {[
+                        'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
+                        'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
+                      ].map((wId, idx) => {
+                        const w = submitWorkers.find((x) => x.worker_id === wId);
+                        const isBusy = w?.state === 'in_flight' || w?.state === 'busy';
+                        return (
+                          <span
+                            key={wId}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                              padding: '3px 8px',
+                              borderRadius: '4px',
+                              fontSize: '0.72rem',
+                              fontWeight: 600,
+                              background: isBusy ? 'rgba(168, 85, 247, 0.2)' : 'rgba(51, 65, 85, 0.4)',
+                              border: `1px solid ${isBusy ? 'rgba(168, 85, 247, 0.5)' : '#334155'}`,
+                              color: isBusy ? '#c084fc' : '#94a3b8',
+                            }}
+                            title={isBusy ? `Currently submitting: ${w?.current_application_id || 'Workday task'}` : `Submitting Worker ${idx + 1} ready & idle`}
+                          >
+                            <span style={{
+                              width: '6px',
+                              height: '6px',
+                              borderRadius: '50%',
+                              background: isBusy ? '#c084fc' : '#10b981',
+                              boxShadow: isBusy ? '0 0 6px #c084fc' : 'none',
+                            }} />
+                            Submit Bot {idx + 1}: {isBusy ? '⚡ Applying' : 'Idle'}
+                          </span>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <div className="video-table-container">
@@ -740,7 +844,7 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
                               const isReady = !isSubmitted && !isApplying && !isQueued && !isFailed;
 
                               // STRICT 3-BUCKET DISPLAY: Screenshot rendered ONLY when submitted!
-                              const rawProof = isSubmitted ? (app.application_submitted_screenshot_url || app.screenshot_url || app.applied_screenshot || null) : null;
+                              const rawProof = isSubmitted ? (app.application_submitted_screenshot_url || null) : null;
                               const proofShot = resolveSupabaseStorageUrl(rawProof);
 
                               const jobUrl = app.job_url || app.url || '';
@@ -801,28 +905,33 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
                                   </td>
                                   <td style={{ textAlign: 'center' }}>
                                     {isSubmitted && proofShot ? (
-                                      <a
-                                        href={proofShot}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        onClick={(e) => e.stopPropagation()}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setSelectedScreenshot({
+                                            url: proofShot,
+                                            company: app.company,
+                                            role: displayTitle,
+                                          });
+                                        }}
                                         style={{
                                           padding: '4px 9px',
                                           borderRadius: '4px',
                                           fontSize: '0.74rem',
                                           fontWeight: 'bold',
-                                          textDecoration: 'none',
                                           background: 'rgba(16, 185, 129, 0.15)',
                                           color: '#34d399',
                                           border: '1px solid rgba(16, 185, 129, 0.3)',
+                                          cursor: 'pointer',
                                           display: 'inline-flex',
                                           alignItems: 'center',
                                           gap: '4px',
                                         }}
                                         title="Click to view verified Playwright submission confirmation screenshot"
                                       >
-                                        📸 View Proof ↗
-                                      </a>
+                                        📸 View Proof
+                                      </button>
                                     ) : (
                                       <span style={{ fontSize: '0.8rem', color: '#475569' }}>—</span>
                                     )}
@@ -932,6 +1041,103 @@ export default function OperatorDashboard({ operatorView = 'dashboard' }) {
               </div>
             )}
           </main>
+        </div>
+      )}
+
+      {/* Authentic Submission Proof Screenshot Modal */}
+      {selectedScreenshot && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.85)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 99999,
+            padding: '1.5rem',
+          }}
+          onClick={() => setSelectedScreenshot(null)}
+        >
+          <div
+            style={{
+              background: '#0f172a',
+              border: '1px solid #334155',
+              borderRadius: '8px',
+              maxWidth: '90vw',
+              maxHeight: '90vh',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 20px 40px rgba(0,0,0,0.6)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '0.75rem 1.25rem',
+                borderBottom: '1px solid #1e293b',
+                background: '#1e293b',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ color: '#34d399', fontWeight: 700, fontSize: '0.9rem' }}>
+                  ✓ Workday Application Submission Proof
+                </span>
+                <span style={{ color: '#94a3b8', fontSize: '0.8rem' }}>
+                  ({selectedScreenshot.company} — {selectedScreenshot.role})
+                </span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                {selectedScreenshot.url && (
+                  <a
+                    href={selectedScreenshot.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      fontSize: '0.75rem',
+                      color: '#38bdf8',
+                      textDecoration: 'none',
+                      fontWeight: 600,
+                    }}
+                  >
+                    Open Full Image ↗
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setSelectedScreenshot(null)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#94a3b8',
+                    cursor: 'pointer',
+                    fontSize: '1.2rem',
+                    lineHeight: 1,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div style={{ padding: '1rem', overflow: 'auto', textAlign: 'center', background: '#020617' }}>
+              <img
+                src={selectedScreenshot.url}
+                alt="Workday Submission Proof"
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: '75vh',
+                  objectFit: 'contain',
+                  borderRadius: '4px',
+                  border: '1px solid #1e293b',
+                }}
+              />
+            </div>
+          </div>
         </div>
       )}
 
