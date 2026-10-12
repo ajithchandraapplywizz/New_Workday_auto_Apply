@@ -354,7 +354,7 @@ export default function LoginPage({ accessDenied }) {
 
               <div className="form-group">
                 <label className="form-label" htmlFor="login-code">
-                  MICROSOFT AUTHENTICATOR 6-DIGIT CODE
+                  6-DIGIT ACCESS CODE (DEFAULT: 000000)
                 </label>
                 <div className="input-with-icon">
                   <KeyRound size={16} className="input-icon" />
@@ -364,7 +364,7 @@ export default function LoginPage({ accessDenied }) {
                     inputMode="numeric"
                     maxLength={6}
                     className="form-input code-input"
-                    placeholder="------"
+                    placeholder="000000"
                     value={code}
                     onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
                     disabled={loading}
