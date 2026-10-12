@@ -37,6 +37,7 @@ import { setGlobalStop, isGlobalStopRequested, abortAllActiveBrowsers } from '..
 import { createClient } from '@supabase/supabase-js';
 import { handleAuthRequest, handleOperatorsRequest, authenticateStaffRole } from '../lib/authService.mjs';
 import { handleAdminStatsRequest } from '../lib/adminStatsService.mjs';
+import { handleAdminDashboardRequest } from '../lib/adminDashboard.mjs';
 
 loadLocalEnvOnce();
 
@@ -367,6 +368,11 @@ const server = http.createServer(async (req, res) => {
     const authUser = authenticateStaffRole(req, res, ['admin', 'developer', 'dev']);
     if (!authUser) return; // 401 or 403 sent by middleware
     return handleAdminStatsRequest(req, res, parsedUrl.searchParams);
+  }
+
+  // 2e. Phase E Admin Dashboard: GET /api/admin/dashboard?range=today|7d|30d|all
+  if (pathname === '/api/admin/dashboard' && req.method === 'GET') {
+    return handleAdminDashboardRequest(req, res, parsedUrl.searchParams);
   }
 
   // 3. Stop Webhook

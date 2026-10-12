@@ -11,11 +11,14 @@ import {
   fetchStaffAccessList,
   authAdminAllowSetup,
   authAdminResetMfa,
+  fetchAdminDashboardStats,
+  getISTDateBounds,
   supabase,
 } from '../services/api';
 import CAClientDetailsModal from '../components/CAClientDetailsModal';
 import OperatorDetailsPage from './OperatorDetailsPage';
 import ApplicationSlideDrawer from '../components/ApplicationSlideDrawer';
+import StaffAccess from '../components/StaffAccess';
 
 export default function AdminDashboard() {
   const { date, timeframe } = useAuth();
@@ -62,26 +65,31 @@ export default function AdminDashboard() {
   const [isSyncingCompany, setIsSyncingCompany] = useState(false);
   const [syncToast, setSyncToast] = useState(null);
 
+  // Phase E: Dashboard payload state
+  const [dashboardData, setDashboardData] = useState(null);
+
   // Tabs as specified in Master Prompt section 5 & S5a-2 requirement 6
   const tabs = ['Overview', 'Managers', 'Operators', 'Staff access', 'Guide'];
 
-  // Load all dynamic data with real-time updates
+  // Phase E: Load dynamic admin data strictly via protected GET /api/admin/dashboard driven by existing date & timeframe filter
   const loadData = React.useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [reconRes, mgrsRes, opsRes, kpiRes, appsRes] = await Promise.all([
-        reconcileOperatorsWithAPI(),
-        fetchManagers(),
-        fetchOperators({ dateStr: date }),
-        fetchDynamicKPIMetrics({ dateStr: date, timeframe }),
-        fetchApplicationsDynamic({ dateStr: date, timeframe, limit: 200 }),
-      ]);
-
-      if (reconRes.success) setReconciliation(reconRes);
-      if (mgrsRes.success) setManagers(mgrsRes.managers);
-      if (opsRes.success) setOperators(opsRes.operators);
-      if (kpiRes.success) setKpis(kpiRes);
-      if (appsRes.success) setApplications(appsRes.applications);
+      const bounds = getISTDateBounds(date, timeframe);
+      const res = await fetchAdminDashboardStats({
+        range: timeframe,
+        from: bounds?.startIso,
+        to: bounds?.endIso,
+      });
+      if (res && res.success) {
+        setDashboardData(res);
+        if (res.presence?.operators) {
+          setOperators(res.presence.operators);
+        }
+        if (res.cas?.byManager) {
+          setManagers(res.cas.byManager.map((m) => ({ id: m.manager_id, name: m.name })));
+        }
+      }
     } catch (err) {
       console.error('Error loading Admin dashboard data:', err);
     } finally {
@@ -90,27 +98,15 @@ export default function AdminDashboard() {
   }, [date, timeframe]);
 
   useEffect(() => {
-    let isMounted = true;
     loadData(false);
 
-    // Dynamic 3s interval for live updates
+    // Dynamic 30s interval for live updates per Phase E requirement
     const pollInterval = setInterval(() => {
       loadData(true);
-    }, 3000);
-
-    // Supabase Realtime channel for instant push updates
-    const channel = supabase
-      .channel('admin-dashboard-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'applications' }, () => loadData(true))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'batch_job_queue' }, () => loadData(true))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'client_assignment_log' }, () => loadData(true))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'operators' }, () => loadData(true))
-      .subscribe();
+    }, 30000);
 
     return () => {
-      isMounted = false;
       clearInterval(pollInterval);
-      supabase.removeChannel(channel);
     };
   }, [loadData]);
 
@@ -459,6 +455,20 @@ export default function AdminDashboard() {
             </button>
           </div>
 
+          {/* Phase E: Active Filter Info from Header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.82rem', color: '#94a3b8', fontWeight: 600 }}>
+                ACTIVE PERIOD: <strong style={{ color: '#38bdf8' }}>{String(timeframe || 'day').toUpperCase()}</strong> ({date})
+              </span>
+            </div>
+            {dashboardData?.generatedAt && (
+              <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                Synced: {new Date(dashboardData.generatedAt).toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+
           {/* Grid of Dynamic Metric Tiles */}
           <div className="video-admin-kpi-grid">
             {/* Total Operators Tile (Clickable) */}
@@ -469,7 +479,7 @@ export default function AdminDashboard() {
               title="Click to view All Operators"
             >
               <span className="vkpi-label">TOTAL OPERATORS</span>
-              <span className="vkpi-val">{operators.length}</span>
+              <span className="vkpi-val">{dashboardData?.cas?.total ?? '—'}</span>
             </div>
 
             {/* Active Operators Tile (Clickable) */}
@@ -480,7 +490,7 @@ export default function AdminDashboard() {
               title="Click to view Active Operators (Logged In on Website)"
             >
               <span className="vkpi-label">ACTIVE OPERATORS</span>
-              <span className="vkpi-val" style={{ color: '#10b981' }}>{activeOpsCount}</span>
+              <span className="vkpi-val" style={{ color: '#10b981' }}>{dashboardData?.presence?.active ?? '—'}</span>
             </div>
 
             {/* Inactive Operators Tile (Clickable) */}
@@ -491,82 +501,88 @@ export default function AdminDashboard() {
               title="Click to view Inactive Operators"
             >
               <span className="vkpi-label">INACTIVE OPERATORS</span>
-              <span className="vkpi-val" style={{ color: '#94a3b8' }}>{inactiveOpsCount}</span>
+              <span className="vkpi-val" style={{ color: '#94a3b8' }}>{dashboardData?.presence?.inactive ?? '—'}</span>
             </div>
 
             {/* Submitted */}
             <div className="video-kpi-box">
               <span className="vkpi-label">SUBMITTED</span>
-              <span className="vkpi-val" style={{ color: '#10b981' }}>{kpis.submitted}</span>
+              <span className="vkpi-val" style={{ color: '#10b981' }}>{dashboardData?.tasks?.submitted ?? '—'}</span>
             </div>
 
             {/* Ready For Review */}
             <div className="video-kpi-box">
               <span className="vkpi-label">READY FOR REVIEW</span>
-              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 102}</span>
+              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{dashboardData?.tasks?.ready_for_review ?? '—'}</span>
             </div>
 
             {/* Running / Applying (Live) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">RUNNING</span>
-              <span className="vkpi-val">{kpis.running ?? kpis.applying ?? 0}</span>
+              <span className="vkpi-val">{dashboardData?.tasks?.applying ?? '—'}</span>
             </div>
 
             {/* Queued */}
             <div className="video-kpi-box">
               <span className="vkpi-label">QUEUED</span>
-              <span className="vkpi-val">{kpis.queued}</span>
+              <span className="vkpi-val">{dashboardData?.tasks?.queued ?? '—'}</span>
             </div>
 
             {/* Failed */}
             <div className="video-kpi-box">
               <span className="vkpi-label">FAILED</span>
-              <span className="vkpi-val" style={{ color: '#ef4444' }}>{kpis.failed}</span>
+              <span className="vkpi-val" style={{ color: '#ef4444' }}>{dashboardData?.tasks?.failed ?? '—'}</span>
+            </div>
+
+            {/* Needs Answers (Phase E New Tile) */}
+            <div className="video-kpi-box">
+              <span className="vkpi-label">NEEDS ANSWERS</span>
+              <span className="vkpi-val" style={{ color: '#f59e0b' }}>{dashboardData?.tasks?.needs_answers ?? '—'}</span>
             </div>
 
             {/* Zoho Gateway Integration Status */}
             <div
               className="video-kpi-box"
-              style={{ borderLeft: '3px solid #10b981' }}
-              title={zohoNotConnectedCount > 0 ? `Zoho Mail Gateway connected (${zohoNotConnectedCount} client mailbox(es) unlinked in pool)` : "Zoho Mail Gateway online and connected"}
+              style={{ borderLeft: dashboardData?.integrations?.zoho?.unlinked_mailboxes != null ? (dashboardData.integrations.zoho.unlinked_mailboxes > 0 ? '3px solid #f59e0b' : '3px solid #10b981') : '3px solid #64748b' }}
+              title={dashboardData?.integrations?.zoho?.unlinked_mailboxes != null ? `Unlinked client mailboxes for the selected period: ${dashboardData.integrations.zoho.unlinked_mailboxes}` : "Zoho Mail Gateway status not verified"}
             >
-              <span className="vkpi-label" style={{ color: '#10b981' }}>ZOHO INTEGRATION</span>
-              <span className="vkpi-val" style={{ color: '#10b981', fontSize: '1.05rem', fontWeight: 'bold' }}>
-                CONNECTED
+              <span className="vkpi-label">ZOHO MAILBOXES</span>
+              <span className="vkpi-val" style={{ color: dashboardData?.integrations?.zoho?.unlinked_mailboxes != null ? (dashboardData.integrations.zoho.unlinked_mailboxes > 0 ? '#f59e0b' : '#10b981') : '#94a3b8', fontSize: '1.05rem', fontWeight: 'bold' }}>
+                {dashboardData?.integrations?.zoho?.unlinked_mailboxes != null ? `Unlinked: ${dashboardData.integrations.zoho.unlinked_mailboxes}` : '—'}
               </span>
             </div>
 
             {/* Supabase Answer % (Tier 1) */}
             <div className="video-kpi-box highlighted">
               <span className="vkpi-label">SUPABASE %</span>
-              <span className="vkpi-val">{kpis.answerSources?.supabasePct ?? 0}%</span>
+              <span className="vkpi-val">{dashboardData?.answerSources?.supabase_pct != null ? `${dashboardData.answerSources.supabase_pct}%` : '—'}</span>
             </div>
 
             {/* Resume Answer % (Tier 2) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">RESUME %</span>
-              <span className="vkpi-val">{kpis.answerSources?.resumePct ?? 0}%</span>
+              <span className="vkpi-val">{dashboardData?.answerSources?.resume_pct != null ? `${dashboardData.answerSources.resume_pct}%` : '—'}</span>
             </div>
 
             {/* CRM API Answer % (Tier 3) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">CRM API %</span>
-              <span className="vkpi-val">{kpis.answerSources?.crmPct ?? 0}%</span>
+              <span className="vkpi-val">{dashboardData?.answerSources?.api_pct != null ? `${dashboardData.answerSources.api_pct}%` : '—'}</span>
             </div>
 
             {/* AI Answer % (Tier 4) */}
             <div className="video-kpi-box">
               <span className="vkpi-label">AI %</span>
-              <span className="vkpi-val">{kpis.answerSources?.aiPct ?? 0}%</span>
+              <span className="vkpi-val">{dashboardData?.answerSources?.ai_pct != null ? `${dashboardData.answerSources.ai_pct}%` : '—'}</span>
             </div>
           </div>
 
           {/* Company Wide Operational Health Summary */}
           <div className="video-card-section" style={{ marginTop: '1.5rem' }}>
-            <span className="vcs-title">COMPANY-WIDE APPLICATION AUDIT ({timeframe.toUpperCase()})</span>
+            <span className="vcs-title">COMPANY-WIDE APPLICATION AUDIT ({String(timeframe || 'day').toUpperCase()})</span>
             <div className="vcs-content-line">
-              Total Recorded Applications: <strong>{kpis.total}</strong> &bull; Total Reviewed Answers:{' '}
-              <strong>{kpis.answerSources.total}</strong> &bull; Active Date Window: <strong>{date}</strong>
+              Total CAs: <strong>{dashboardData?.cas?.total ?? '—'}</strong> &bull; Total Answers Evaluated:{' '}
+              <strong>{dashboardData?.answerSources?.total ?? '—'}</strong> &bull; Period: <strong>{String(timeframe || 'day').toUpperCase()} ({date})</strong>
             </div>
           </div>
         </div>
@@ -588,20 +604,26 @@ export default function AdminDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {managers.map((mgr) => {
-                  const mgrOps = operators.filter((o) => o.manager_id === mgr.id);
-                  const activeCount = mgrOps.filter((o) => getOperatorEffectiveStatus(o) === 'active').length;
-                  const inactiveCount = mgrOps.length - activeCount;
-                  const mgrApps = applications.filter((a) => a.manager_id === mgr.id).length;
+                {(dashboardData?.cas?.byManager && dashboardData.cas.byManager.length > 0
+                  ? dashboardData.cas.byManager
+                  : managers
+                ).map((mgr) => {
+                  const mid = mgr.manager_id || mgr.id;
+                  const mName = mgr.name;
+                  const mEmail = mgr.email || (mName.toLowerCase().includes('balaji') ? 'balaji@applywizz.com' : 'ramakrishna@applywizz.com');
+                  const opCount = typeof mgr.count === 'number' ? mgr.count : operators.filter((o) => o.manager_id === mid).length;
+                  const mgrOps = (dashboardData?.presence?.operators || operators).filter((o) => o.manager_id === mid);
+                  const activeCount = mgrOps.filter((o) => (typeof o.is_online === 'boolean' ? o.is_online : getOperatorEffectiveStatus(o) === 'active')).length;
+                  const inactiveCount = opCount - activeCount;
 
                   return (
-                    <tr key={mgr.id}>
+                    <tr key={mid}>
                       <td>
-                        <strong>{mgr.name}</strong>
+                        <strong>{mName}</strong>
                       </td>
-                      <td>{mgr.email}</td>
+                      <td>{mEmail}</td>
                       <td>
-                        <strong>{mgrOps.length}</strong>
+                        <strong>{opCount}</strong>
                       </td>
                       <td>
                         <span style={{ color: activeCount > 0 ? '#10b981' : '#94a3b8', fontWeight: 'bold' }}>
@@ -612,13 +634,57 @@ export default function AdminDashboard() {
                         <span style={{ color: '#94a3b8' }}>{inactiveCount}</span>
                       </td>
                       <td>
-                        <strong>{mgrApps}</strong>
+                        <strong>{opCount}</strong>
                       </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
+          </div>
+
+          {/* Phase E: Reconciliation List of Excluded Operators (count_in_dashboard = false) */}
+          <div className="video-card-section" style={{ marginTop: '1.5rem' }}>
+            <span className="vcs-title">RECONCILIATION — EXCLUDED FROM OPERATIONAL ROSTER</span>
+            <p style={{ color: '#94a3b8', fontSize: '0.85rem', margin: '0.25rem 0 0.75rem 0' }}>
+              The following operators exist in the database with count_in_dashboard = false and are excluded from the 59-operator operational roster:
+            </p>
+            <div className="video-table-container">
+              <table className="video-data-table">
+                <thead>
+                  <tr>
+                    <th>NAME</th>
+                    <th>EMAIL</th>
+                    <th>ASSIGNED MANAGER</th>
+                    <th>REASON</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(dashboardData?.reconciliation?.excluded || []).length > 0 ? (
+                    dashboardData.reconciliation.excluded.map((ex) => (
+                      <tr key={ex.id || ex.email}>
+                        <td>
+                          <strong>{ex.name}</strong>
+                        </td>
+                        <td>{ex.email}</td>
+                        <td>
+                          {ex.manager_id === 'bebf9e8d-5bcc-4f77-b0a8-b8b80c3ca744' ? 'Ramakrishna Tejavath' : (ex.manager_id === '9dc9376e-fbc5-440b-932f-38da10b89a70' ? 'Balaji' : 'Unassigned')}
+                        </td>
+                        <td style={{ color: '#f59e0b', fontSize: '0.85rem' }}>
+                          {ex.reason}
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={4} style={{ textAlign: 'center', color: '#64748b' }}>
+                        No operators currently excluded.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -721,203 +787,8 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {/* 4. STAFF ACCESS TAB — Microsoft Authenticator MFA Enrollment & Setup */}
-      {activeTab === 'Staff access' && (
-        <div className="tab-body-fade">
-          <div className="video-card-section" style={{ marginBottom: '1.25rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
-              <div>
-                <span className="vcs-title">STAFF AUTHENTICATOR & ACCESS CONTROL</span>
-                <p style={{ color: '#94a3b8', fontSize: '0.875rem', marginTop: '0.25rem' }}>
-                  Manage Microsoft Authenticator enrollment, grant setup permissions for new staff, and reset lost authenticators.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={loadStaffList}
-                disabled={staffLoading}
-                style={{
-                  background: 'rgba(59, 130, 246, 0.15)',
-                  border: '1px solid rgba(59, 130, 246, 0.4)',
-                  color: '#60a5fa',
-                  padding: '6px 14px',
-                  borderRadius: '6px',
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: '0.85rem',
-                }}
-              >
-                {staffLoading ? 'Refreshing...' : '↻ Refresh List'}
-              </button>
-            </div>
-
-            {staffFeedback && (
-              <div
-                style={{
-                  marginTop: '1rem',
-                  padding: '0.75rem 1rem',
-                  borderRadius: '6px',
-                  background: staffFeedback.type === 'success' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
-                  border: `1px solid ${staffFeedback.type === 'success' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
-                  color: staffFeedback.type === 'success' ? '#34d399' : '#f87171',
-                  fontSize: '0.875rem',
-                }}
-              >
-                {staffFeedback.text}
-              </div>
-            )}
-          </div>
-
-          <div className="video-filter-bar" style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
-            <input
-              type="text"
-              value={staffSearch}
-              onChange={(e) => setStaffSearch(e.target.value)}
-              placeholder="Search staff by name, email, or role..."
-              className="video-input-search"
-              style={{ maxWidth: '400px' }}
-            />
-            <span style={{ alignSelf: 'center', fontSize: '0.85rem', color: '#94a3b8' }}>
-              Showing {filteredStaff.length} of {staffList.length} staff accounts
-            </span>
-          </div>
-
-          <div className="video-table-container">
-            <table className="video-data-table">
-              <thead>
-                <tr>
-                  <th>STAFF MEMBER</th>
-                  <th>ROLE</th>
-                  <th>ENROLLED</th>
-                  <th>SETUP ALLOWED</th>
-                  <th>LAST SEEN</th>
-                  <th>ACTIONS</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredStaff.length > 0 ? (
-                  filteredStaff.map((member) => {
-                    const isEnrolled = Boolean(member.mfa_enrolled);
-                    const isSetupAllowed = Boolean(member.setup_allowed);
-                    const isWorking = staffActionInProgress === member.email;
-
-                    return (
-                      <tr key={member.id || member.email}>
-                        <td>
-                          <div>
-                            <strong>{member.name || 'Staff User'}</strong>
-                            <div style={{ color: '#94a3b8', fontSize: '0.8rem' }}>{member.email}</div>
-                          </div>
-                        </td>
-                        <td>
-                          <span
-                            style={{
-                              textTransform: 'uppercase',
-                              fontWeight: 700,
-                              fontSize: '0.75rem',
-                              padding: '2px 8px',
-                              borderRadius: '4px',
-                              background:
-                                member.role === 'admin'
-                                  ? 'rgba(239, 68, 68, 0.2)'
-                                  : member.role === 'developer'
-                                  ? 'rgba(168, 85, 247, 0.2)'
-                                  : member.role === 'manager'
-                                  ? 'rgba(59, 130, 246, 0.2)'
-                                  : 'rgba(100, 116, 139, 0.2)',
-                              color:
-                                member.role === 'admin'
-                                  ? '#f87171'
-                                  : member.role === 'developer'
-                                  ? '#c084fc'
-                                  : member.role === 'manager'
-                                  ? '#60a5fa'
-                                  : '#cbd5e1',
-                            }}
-                          >
-                            {member.role || 'staff'}
-                          </span>
-                        </td>
-                        <td>
-                          <span
-                            className={`video-status-tag ${isEnrolled ? 'active' : 'inactive'}`}
-                            style={{
-                              background: isEnrolled ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
-                              color: isEnrolled ? '#34d399' : '#f87171',
-                              border: `1px solid ${isEnrolled ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
-                            }}
-                          >
-                            {isEnrolled ? 'YES' : 'NO'}
-                          </span>
-                        </td>
-                        <td>
-                          <span
-                            className={`video-status-tag ${isSetupAllowed ? 'active' : 'inactive'}`}
-                            style={{
-                              background: isSetupAllowed ? 'rgba(59, 130, 246, 0.15)' : 'rgba(100, 116, 139, 0.15)',
-                              color: isSetupAllowed ? '#60a5fa' : '#94a3b8',
-                              border: `1px solid ${isSetupAllowed ? 'rgba(59, 130, 246, 0.3)' : 'rgba(100, 116, 139, 0.3)'}`,
-                            }}
-                          >
-                            {isSetupAllowed ? 'YES' : 'NO'}
-                          </span>
-                        </td>
-                        <td style={{ color: '#94a3b8', fontSize: '0.8rem' }}>
-                          {member.last_seen_at ? new Date(member.last_seen_at).toLocaleTimeString() : '—'}
-                        </td>
-                        <td>
-                          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                            <button
-                              type="button"
-                              onClick={() => handleAllowSetup(member.email)}
-                              disabled={isWorking}
-                              style={{
-                                padding: '5px 10px',
-                                borderRadius: '5px',
-                                border: '1px solid #3b82f6',
-                                background: 'rgba(59, 130, 246, 0.15)',
-                                color: '#60a5fa',
-                                fontWeight: 600,
-                                fontSize: '0.75rem',
-                                cursor: isWorking ? 'wait' : 'pointer',
-                              }}
-                            >
-                              Allow setup
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleResetMfa(member.email)}
-                              disabled={isWorking}
-                              style={{
-                                padding: '5px 10px',
-                                borderRadius: '5px',
-                                border: '1px solid #ef4444',
-                                background: 'rgba(239, 68, 68, 0.15)',
-                                color: '#f87171',
-                                fontWeight: 600,
-                                fontSize: '0.75rem',
-                                cursor: isWorking ? 'wait' : 'pointer',
-                              }}
-                            >
-                              Reset authenticator
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                ) : (
-                  <tr>
-                    <td colSpan={6} style={{ textAlign: 'center', padding: '2rem', color: '#64748b' }}>
-                      {staffLoading ? 'Loading staff access list...' : 'No staff accounts found.'}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      {/* 4. STAFF ACCESS TAB */}
+      {activeTab === 'Staff access' && <StaffAccess />}
 
       {/* 5. GUIDE TAB */}
       {activeTab === 'Guide' && (

@@ -644,6 +644,45 @@ export async function fetchStaffAccessList(token) {
 }
 
 /**
+ * Phase E: Fetch Protected Admin Dashboard Data: GET /api/admin/dashboard?range=today|7d|30d|all
+ * ONE protected backend endpoint returning cas, presence, tasks, answerSources, integrations, reconciliation.
+ */
+export async function fetchAdminDashboardStats({ range = 'all', from = null, to = null } = {}) {
+  const token = localStorage.getItem('applywizz_auth_token') || '';
+  const headers = {
+    'Accept': 'application/json',
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+  };
+
+  const params = new URLSearchParams();
+  if (range) params.append('range', String(range).toLowerCase());
+  if (from) params.append('from', from);
+  if (to) params.append('to', to);
+
+  const endpoint = `${DAEMON_BASE_URL}/api/admin/dashboard?${params.toString()}`;
+  const res = await fetch(endpoint, { headers }).catch((err) => {
+    console.warn('[API] fetchAdminDashboardStats network error:', err?.message);
+    return null;
+  });
+
+  if (!res) {
+    return { success: false, error: 'Network error connecting to backend' };
+  }
+
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent('auth:expired'));
+    return { success: false, status: 401, error: 'Unauthorized: Session expired' };
+  }
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    return { success: false, status: res.status, error: errData.error || `HTTP ${res.status}` };
+  }
+
+  return res.json();
+}
+
+/**
  * 13b. Fetch Admin Stats from Backend SQL Engine: GET /api/admin/stats
  * With automatic same-origin proxy, bearer token detection, and direct Supabase SQL fallback
  */

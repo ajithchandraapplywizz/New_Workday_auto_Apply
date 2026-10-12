@@ -762,6 +762,8 @@ export async function executeWorkerTask({
           }
         }
           let storagePath = null;
+          let bucket = null;
+          let filename = null;
           if (status === 'submitted') {
             bucket = 'submitted-applications';
             filename = taskId
@@ -774,13 +776,14 @@ export async function executeWorkerTask({
             storagePath = filename;
           }
 
-          completionShotUrl = await uploadStorageScreenshot(bucket, filename, buf);
-          if (completionShotUrl) {
-            console.log(`[${workerId}] screenshot uploaded: ${filename}`);
+          if (bucket && filename && buf) {
+            completionShotUrl = await uploadStorageScreenshot(bucket, filename, buf);
+            if (completionShotUrl) {
+              console.log(`[${workerId}] screenshot uploaded: ${filename}`);
+            }
           }
         }
-      }
-    } catch {}
+      } catch {}
 
     const onReviewPage = String(detectedStep || profile._currentStep || '').toLowerCase().includes('review');
     const isSuccessStatus = (

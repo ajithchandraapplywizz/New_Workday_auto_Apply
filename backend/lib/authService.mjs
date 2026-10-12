@@ -33,6 +33,7 @@ import {
   handleAdminAllowSetup,
   handleMfaLogout,
   handleAdminStaffList,
+  verifyMfaJwt,
 } from './mfaAuth.mjs';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://rltnrnqqmufeeqaodsif.supabase.co';
@@ -68,7 +69,9 @@ export function verifyJwt(token) {
   if (parts.length !== 3) return null;
   const [b64Header, b64Payload, signature] = parts;
   const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(`${b64Header}.${b64Payload}`).digest('base64url');
-  if (signature !== expectedSig) return null;
+  if (signature !== expectedSig) {
+    return verifyMfaJwt(token);
+  }
   try {
     const payload = JSON.parse(Buffer.from(b64Payload, 'base64url').toString('utf8'));
     const nowSec = Math.floor(Date.now() / 1000);
@@ -339,7 +342,7 @@ export async function handleAuthRequest(req, res, pathname, body = {}) {
       return res.end(JSON.stringify({ success: false, error: 'Unauthorized: JWT required' }));
     }
 
-    const decoded = verifyJwt(token);
+    const decoded = verifyJwt(token) || verifyMfaJwt(token);
     if (!decoded || !decoded.email) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ success: false, error: 'Unauthorized: Invalid or expired JWT' }));
