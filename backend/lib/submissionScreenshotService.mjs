@@ -14,7 +14,9 @@ import { loadLocalEnvOnce } from './supabaseClient.mjs';
 import { createClient } from '@supabase/supabase-js';
 
 loadLocalEnvOnce();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 export const BUCKET_NAME = 'submitted-applications';
 

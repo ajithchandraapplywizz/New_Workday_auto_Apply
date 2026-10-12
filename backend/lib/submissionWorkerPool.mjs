@@ -14,7 +14,9 @@ import { getWorkerContext, isGlobalStopRequested } from './browserLifecycle.mjs'
 import { PIPELINE_CONFIG } from '../config/pipelineConfig.mjs';
 
 loadLocalEnvOnce();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 export const SUBMISSION_WORKER_IDS = PIPELINE_CONFIG.submitWorkerIds || Array.from({ length: 10 }, (_, i) => `worker_${i + 1}`);
 
