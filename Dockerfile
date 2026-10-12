@@ -1,23 +1,21 @@
-# Official Microsoft Playwright image with all Linux system dependencies pre-installed
+# Official Microsoft Playwright image with all Linux system dependencies (libglib-2.0, libnss3, etc.) pre-installed
 FROM mcr.microsoft.com/playwright:v1.63.0-noble
 
 WORKDIR /app
 
-# Set environment variables for Railway headless container execution
+# Set environment
 ENV NODE_ENV=production
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV HEADLESS=true
-ENV PORT=8080
 
 # Copy project files
 COPY . .
 
-# Install dependencies across all workspaces
+# Install dependencies
 RUN npm install
 
 # Expose default port
+ENV PORT=8080
 EXPOSE 8080
 
 # Start autonomous queue daemon
 CMD ["node", "index.js"]
-
