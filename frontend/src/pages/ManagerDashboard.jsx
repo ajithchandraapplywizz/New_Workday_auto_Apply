@@ -5,6 +5,9 @@ import {
   fetchManagerTeamWorkHistory,
   fetchApplicationsDynamic,
   syncGlobalCompanyData,
+  fetchAdminDashboardStats,
+  getISTDateBounds,
+  supabase,
 } from '../services/api';
 import CAClientDetailsModal from '../components/CAClientDetailsModal';
 import OperatorDetailsPage from './OperatorDetailsPage';
@@ -38,6 +41,7 @@ export default function ManagerDashboard() {
   const [activeWorkDate, setActiveWorkDate] = useState(date);
   const [isFallbackDate, setIsFallbackDate] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [managerKpis, setManagerKpis] = useState(null);
 
   // Applications Tab states
   const [appSearchQuery, setAppSearchQuery] = useState('');
@@ -74,11 +78,12 @@ export default function ManagerDashboard() {
   };
 
   // Strictly pre-scoped query to manager_id (Zero data duplication between Balaji & Ramakrishna)
-  const loadManagerData = React.useCallback(async () => {
-    setLoading(true);
+  const loadManagerData = React.useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setSelectedCA('All');
     try {
-      const [teamRes, appsRes] = await Promise.all([
+      const bounds = getISTDateBounds(date, timeframe);
+      const [teamRes, appsRes, statsRes] = await Promise.all([
         fetchManagerTeamWorkHistory({
           managerId: activeManagerId,
           dateStr: date,
@@ -88,6 +93,12 @@ export default function ManagerDashboard() {
           dateStr: date,
           timeframe,
           limit: 200,
+        }),
+        fetchAdminDashboardStats({
+          range: timeframe,
+          from: bounds?.startIso,
+          to: bounds?.endIso,
+          managerId: activeManagerId,
         }),
       ]);
 
@@ -101,16 +112,43 @@ export default function ManagerDashboard() {
       if (appsRes.success) {
         setApplications(appsRes.applications || []);
       }
+
+      if (statsRes && statsRes.success) {
+        setManagerKpis(statsRes);
+      }
     } catch (err) {
       console.error('Error loading manager data:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [activeManagerId, date, timeframe]);
 
   useEffect(() => {
-    loadManagerData();
-  }, [loadManagerData]);
+    loadManagerData(false);
+
+    // Supabase Realtime channel for instant push updates on DB changes
+    const channel = supabase
+      .channel(`manager-dashboard-${activeManagerId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'submission_tasks' }, () => {
+        loadManagerData(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'job_distributions' }, () => {
+        loadManagerData(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'auth_users' }, () => {
+        loadManagerData(true);
+      })
+      .subscribe();
+
+    const interval = setInterval(() => {
+      loadManagerData(true);
+    }, 15000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(interval);
+    };
+  }, [loadManagerData, activeManagerId]);
 
   // Sync team data directly from CA portal with fallback
   const handleTeamSync = async () => {
@@ -424,6 +462,62 @@ export default function ManagerDashboard() {
       {/* 1. HOME TAB */}
       {activeTab === 'Home' && (
         <div className="tab-body-fade">
+          {/* Manager Team Dynamic KPI Grid */}
+          <div className="video-admin-kpi-grid" style={{ marginBottom: '1.25rem' }}>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">TOTAL OPERATORS</span>
+              <span className="vkpi-val">{managerKpis?.cas?.total ?? operators.length}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">ACTIVE OPERATORS</span>
+              <span className="vkpi-val" style={{ color: '#10b981' }}>{managerKpis?.presence?.active ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">INACTIVE OPERATORS</span>
+              <span className="vkpi-val" style={{ color: '#94a3b8' }}>{managerKpis?.presence?.inactive ?? operators.length}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">READY FOR REVIEW</span>
+              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{managerKpis?.tasks?.ready_for_review ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">NEEDS ANSWERS</span>
+              <span className="vkpi-val" style={{ color: '#f59e0b' }}>{managerKpis?.tasks?.needs_answers ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">SUBMITTED</span>
+              <span className="vkpi-val" style={{ color: '#10b981' }}>{managerKpis?.tasks?.submitted ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">RUNNING</span>
+              <span className="vkpi-val">{managerKpis?.tasks?.applying ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">QUEUED</span>
+              <span className="vkpi-val">{managerKpis?.tasks?.queued ?? 0}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">FAILED</span>
+              <span className="vkpi-val" style={{ color: '#ef4444' }}>{managerKpis?.tasks?.failed ?? 0}</span>
+            </div>
+            <div className="video-kpi-box highlighted">
+              <span className="vkpi-label">SUPABASE %</span>
+              <span className="vkpi-val">{managerKpis?.answerSources?.supabase_pct != null ? `${managerKpis.answerSources.supabase_pct}%` : '—'}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">RESUME %</span>
+              <span className="vkpi-val">{managerKpis?.answerSources?.resume_pct != null ? `${managerKpis.answerSources.resume_pct}%` : '—'}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">CRM API %</span>
+              <span className="vkpi-val">{managerKpis?.answerSources?.api_pct != null ? `${managerKpis.answerSources.api_pct}%` : '—'}</span>
+            </div>
+            <div className="video-kpi-box">
+              <span className="vkpi-label">AI %</span>
+              <span className="vkpi-val">{managerKpis?.answerSources?.ai_pct != null ? `${managerKpis.answerSources.ai_pct}%` : '—'}</span>
+            </div>
+          </div>
+
           {/* Scoped Client Allocation Table (Strictly this manager's clients, with exact assigned CA) */}
           <div className="video-table-container">
             <table className="video-data-table">

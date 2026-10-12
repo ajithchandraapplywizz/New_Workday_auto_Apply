@@ -131,7 +131,8 @@ export default function DeveloperDashboard() {
             applying: reconciledApplying,
             failed: kpiRes.failed,
             queued: kpiRes.queued,
-            ready_for_review: kpiRes.ready_for_review ?? 102,
+            ready_for_review: kpiRes.ready_for_review ?? 0,
+            needs_answers: kpiRes.needs_answers ?? 0,
             total: kpiRes.total,
             sources: kpiRes.sources,
             answerSources: kpiRes.answerSources,
@@ -198,7 +199,8 @@ export default function DeveloperDashboard() {
     // Supabase Realtime channel for instant push updates
     const channel = supabase
       .channel('dev-dashboard-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'applications' }, () => loadData(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'submission_tasks' }, () => loadData(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'job_distributions' }, () => loadData(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'worker_status' }, () => loadData(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'batch_job_queue' }, () => loadData(true))
       .subscribe();
@@ -649,7 +651,7 @@ export default function DeveloperDashboard() {
             {/* Tile 6: Ready for Review */}
             <div className="video-kpi-box">
               <span className="vkpi-label">READY FOR REVIEW</span>
-              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 102}</span>
+              <span className="vkpi-val" style={{ color: '#38bdf8' }}>{kpis.ready_for_review ?? 0}</span>
             </div>
 
             {/* Supabase Answer % (Tier 1) */}

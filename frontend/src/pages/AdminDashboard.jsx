@@ -100,12 +100,27 @@ export default function AdminDashboard() {
   useEffect(() => {
     loadData(false);
 
-    // Dynamic 30s interval for live updates per Phase E requirement
+    // 1. Supabase Realtime channel for instant reactive updates when DB changes
+    const channel = supabase
+      .channel('admin-dashboard-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'submission_tasks' }, () => {
+        loadData(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'job_distributions' }, () => {
+        loadData(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'auth_users' }, () => {
+        loadData(true);
+      })
+      .subscribe();
+
+    // 2. Dynamic polling interval for live heartbeat
     const pollInterval = setInterval(() => {
       loadData(true);
-    }, 30000);
+    }, 15000);
 
     return () => {
+      supabase.removeChannel(channel);
       clearInterval(pollInterval);
     };
   }, [loadData]);

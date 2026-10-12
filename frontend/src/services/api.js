@@ -647,7 +647,7 @@ export async function fetchStaffAccessList(token) {
  * Phase E: Fetch Protected Admin Dashboard Data: GET /api/admin/dashboard?range=today|7d|30d|all
  * ONE protected backend endpoint returning cas, presence, tasks, answerSources, integrations, reconciliation.
  */
-export async function fetchAdminDashboardStats({ range = 'all', from = null, to = null } = {}) {
+export async function fetchAdminDashboardStats({ range = 'all', from = null, to = null, managerId = null } = {}) {
   const token = localStorage.getItem('applywizz_auth_token') || '';
   const headers = {
     'Accept': 'application/json',
@@ -658,6 +658,7 @@ export async function fetchAdminDashboardStats({ range = 'all', from = null, to 
   if (range) params.append('range', String(range).toLowerCase());
   if (from) params.append('from', from);
   if (to) params.append('to', to);
+  if (managerId && managerId !== 'All' && managerId !== 'all') params.append('manager_id', managerId);
 
   const endpoint = `${DAEMON_BASE_URL}/api/admin/dashboard?${params.toString()}`;
   const res = await fetch(endpoint, { headers }).catch((err) => {
@@ -1500,34 +1501,54 @@ export async function fetchApplicationsDynamic({
  */
 export async function fetchDynamicKPIMetrics({ dateStr = '', timeframe = 'day', managerId = '', caEmail = '' } = {}) {
   try {
-    // 1. When reading company-wide metrics, query backend SQL stats RPC endpoint directly
-    if ((!managerId || managerId === 'All') && (!caEmail || caEmail === 'All')) {
-      const adminStats = await fetchAdminStats({ range: timeframe || 'day', date: dateStr });
-      if (adminStats?.success) {
-        return {
-          success: true,
-          submitted: adminStats.submitted ?? 0,
-          failed: adminStats.failed ?? 0,
-          running: adminStats.running ?? 0,
-          applying: adminStats.running ?? 0,
-          queued: adminStats.queued ?? 0,
-          ready_for_review: adminStats.ready_for_review ?? 0,
-          total: (adminStats.submitted || 0) + (adminStats.failed || 0) + (adminStats.running || 0) + (adminStats.queued || 0) + (adminStats.ready_for_review || 0),
-          sources: adminStats.sources,
-          operators: adminStats.operators,
-          answerSources: {
-            total: adminStats.sources?.applications_included || 0,
-            supabasePct: adminStats.sources?.supabase_pct ?? 0,
-            resumePct: adminStats.sources?.resume_pct ?? 0,
-            crmPct: adminStats.sources?.crm_pct ?? 0,
-            aiPct: adminStats.sources?.ai_pct ?? 0,
-            pooled: adminStats.sources?.pooled || null,
-            unansweredCount: adminStats.sources?.unanswered_count ?? 0,
-            applicationsIncluded: adminStats.sources?.applications_included ?? 0,
-          },
-        };
-      }
+    const bounds = dateStr && timeframe ? getISTDateBounds(dateStr, timeframe) : null;
+    const res = await fetchAdminDashboardStats({
+      range: timeframe || 'day',
+      from: bounds?.startIso,
+      to: bounds?.endIso,
+      managerId: managerId && managerId !== 'All' ? managerId : undefined,
+    });
+
+    if (res && res.success && res.tasks) {
+      const sbPct = res.answerSources?.supabase_pct ?? res.answerSources?.pooled?.supabase_pct ?? 0;
+      const resPct = res.answerSources?.resume_pct ?? res.answerSources?.pooled?.resume_pct ?? 0;
+      const crmPct = res.answerSources?.api_pct ?? res.answerSources?.pooled?.api_pct ?? 0;
+      const aiPct = res.answerSources?.ai_pct ?? res.answerSources?.pooled?.ai_pct ?? 0;
+
+      return {
+        success: true,
+        submitted: res.tasks.submitted ?? 0,
+        failed: res.tasks.failed ?? 0,
+        running: res.tasks.applying ?? 0,
+        applying: res.tasks.applying ?? 0,
+        queued: res.tasks.queued ?? 0,
+        ready_for_review: res.tasks.ready_for_review ?? 0,
+        needs_answers: res.tasks.needs_answers ?? 0,
+        total: (res.tasks.submitted || 0) + (res.tasks.failed || 0) + (res.tasks.applying || 0) + (res.tasks.queued || 0) + (res.tasks.ready_for_review || 0),
+        sources: {
+          supabase_pct: sbPct,
+          resume_pct: resPct,
+          crm_pct: crmPct,
+          ai_pct: aiPct,
+        },
+        operators: res.presence?.operators || [],
+        answerSources: {
+          total: res.answerSources?.total || res.answerSources?.pooled?.total || 0,
+          supabasePct: sbPct,
+          resumePct: resPct,
+          crmPct: crmPct,
+          aiPct: aiPct,
+          pooled: res.answerSources?.pooled || null,
+          unansweredCount: res.tasks.needs_answers ?? 0,
+          applicationsIncluded: res.answerSources?.total || 0,
+        },
+      };
     }
+  } catch (e) {
+    console.warn('[API] fetchDynamicKPIMetrics backend error, falling back:', e?.message);
+  }
+
+  try {
 
     let query = supabase.from('job_distributions').select('id, status, error_message, created_at, updated_at, worker_id');
 
