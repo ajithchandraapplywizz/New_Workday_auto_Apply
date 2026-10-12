@@ -1,8 +1,8 @@
 
-// Daemon Base URL: configurable via VITE_DAEMON_URL or VITE_BACKEND_URL (defaults to http://localhost:3001)
+// Daemon Base URL: configurable via VITE_DAEMON_URL or VITE_BACKEND_URL (defaults to empty string for relative proxy routing)
 export const DAEMON_BASE_URL = (typeof import.meta !== 'undefined' && (import.meta.env?.VITE_DAEMON_URL || import.meta.env?.VITE_BACKEND_URL))
   ? String(import.meta.env.VITE_DAEMON_URL || import.meta.env.VITE_BACKEND_URL).replace(/\/+$/, '')
-  : 'http://localhost:3001';
+  : '';
 
 /**
  * Normalizes clumsy AWL IDs (e.g. '26828', 'awl26828', '  AWL-26828  ') -> 'AWL-26828'
