@@ -1,33 +1,26 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { getPreviousWorkdayDateStr, getWorkdayInfo } from '../utils/dateUtils';
+import { Menu, X, RefreshCw } from 'lucide-react';
 
-export default function Header({ activeTab, onTabChange, operatorView, onOperatorViewChange }) {
+export default function Header() {
   const { user, switchRole, logout, date, setDate, timeframe, setTimeframe } = useAuth();
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   const getSubTitle = () => {
-    switch (user?.role) {
-      case 'dev': return 'APPLYWIZZ / EXTERNALS';
-      case 'admin': return 'APPLYWIZZ / OPS OPS';
-      case 'manager': return 'APPLYWIZZ / CONTROL ROOM';
-      case 'operator':
-      case 'ca':
-        return 'APPLYWIZZ';
-      default: return 'APPLYWIZZ';
-    }
+    const role = user?.role?.toLowerCase();
+    if (role === 'dev' || role === 'developer') return 'APPLYWIZZ / EXTERNALS';
+    if (role === 'admin') return 'APPLYWIZZ / OPS';
+    return 'APPLYWIZZ';
   };
 
   const getMainTitle = () => {
-    switch (user?.role) {
-      case 'dev': return 'Developer dashboard';
-      case 'admin': return 'Admin dashboard';
-      case 'manager': return 'Manager dashboard';
-      case 'operator':
-      case 'ca':
-        return '';
-      default: return 'Workday Dashboard';
-    }
+    const role = user?.role?.toLowerCase();
+    if (role === 'dev' || role === 'developer') return 'Developer Dashboard';
+    if (role === 'admin') return 'Admin Dashboard';
+    return 'Workday Dashboard';
   };
+
+  const isDeveloperUser = user?.baseRole === 'dev' || user?.role === 'dev' || user?.role === 'developer' || user?.email === 'ajithchandranimmala@applywizz.ai';
 
   return (
     <header className="video-header">
@@ -39,40 +32,40 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
           </div>
           <div className="header-title-container">
             <span className="header-sub-label">{getSubTitle()}</span>
-            {(user?.role === 'operator' || user?.role === 'ca') ? (
-              <div className="operator-nav-pills">
-                <button
-                  type="button"
-                  className={`operator-pill-btn ${operatorView === 'dashboard' ? 'active' : ''}`}
-                  onClick={() => onOperatorViewChange('dashboard')}
-                >
-                  Candidate Queue
-                </button>
-                <button
-                  type="button"
-                  className={`operator-pill-btn ${operatorView === 'stats' ? 'active' : ''}`}
-                  onClick={() => onOperatorViewChange('stats')}
-                >
-                  Stats
-                </button>
-              </div>
-            ) : (
-              <h1 className="header-main-title">{getMainTitle()}</h1>
-            )}
+            <h1 className="header-main-title">{getMainTitle()}</h1>
           </div>
         </div>
 
+        {/* Mobile Quick Action Bar (Visible only on mobile/small screens) */}
+        <div className="header-mobile-bar">
+          <button
+            type="button"
+            className="header-mobile-refresh-btn"
+            onClick={() => window.location.reload()}
+            title="Refresh Page"
+            aria-label="Refresh Page"
+          >
+            <RefreshCw size={16} />
+          </button>
+          <button
+            type="button"
+            className={`header-mobile-menu-btn ${mobileOpen ? 'active' : ''}`}
+            onClick={() => setMobileOpen((prev) => !prev)}
+            aria-label="Toggle Controls Menu"
+          >
+            {mobileOpen ? <X size={20} /> : <Menu size={20} />}
+            <span className="header-mobile-role-tag">{user?.role?.toUpperCase() || 'USER'}</span>
+          </button>
+        </div>
+
         {/* Global Controls: Role Switcher (Developer Only), Date, Timeframe, Refresh, User */}
-        <div className="header-controls-block">
-          {/* ONLY Developer (Ajith) can switch roles across all 4 dashboards */}
-          {(user?.baseRole === 'dev' || user?.role === 'dev' || user?.email === 'ajithchandranimmala@applywizz.ai') && (
+        <div className={`header-controls-block ${mobileOpen ? 'mobile-visible' : ''}`}>
+          {/* ONLY Developer can switch roles between Dev and Admin */}
+          {isDeveloperUser && (
             <div className="role-pill-group" title="Developer Master Override">
               {[
                 { id: 'dev', label: 'Dev' },
                 { id: 'admin', label: 'Admin' },
-                { id: 'manager', label: 'Manager' },
-                { id: 'ca', label: 'CA' },
-                { id: 'operator', label: 'Operator' },
               ].map((r) => (
                 <button
                   key={r.id}
@@ -86,31 +79,22 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
             </div>
           )}
 
-          {/* Date Picker: Hidden for CA/Operator and Manager, locked to Yesterday's work history data */}
-          {(user?.role === 'ca' || user?.role === 'operator' || user?.role === 'manager') ? (
-            <div className="control-date-box" title="Candidate and team work data locked to previous working day's work history">
-              <span className="control-label-micro">WORK DATA DATE</span>
-              <span style={{ fontSize: '0.78rem', fontWeight: 800, color: '#38bdf8', padding: '2px 6px', letterSpacing: '0.02em' }}>
-                {getWorkdayInfo().dateStr} ({getWorkdayInfo().label})
-              </span>
-            </div>
-          ) : (
-            <div className="control-date-box">
-              <span className="control-label-micro">DATE</span>
-              <input
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                className="header-date-input"
-              />
-            </div>
-          )}
+          {/* Date Picker */}
+          <div className="control-date-box">
+            <span className="control-label-micro">DATE</span>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="header-date-input"
+            />
+          </div>
 
-          {/* Timeframe Stats: Only day data enabled for CA/Operator and Manager (no week or month) */}
+          {/* Timeframe Stats */}
           <div className="control-stats-box">
             <span className="control-label-micro">STATS</span>
             <div className="stats-pill-group">
-              {(['ca', 'operator', 'manager'].includes(user?.role) ? ['day'] : ['day', 'week', 'month']).map((t) => (
+              {['day', 'week', 'month'].map((t) => (
                 <button
                   key={t}
                   type="button"
@@ -123,10 +107,10 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
             </div>
           </div>
 
-          {/* Refresh Button */}
+          {/* Refresh Button (Desktop) */}
           <button
             type="button"
-            className="header-refresh-btn"
+            className="header-refresh-btn desktop-only"
             onClick={() => window.location.reload()}
           >
             Refresh
@@ -134,21 +118,21 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
 
           {/* User & Sign Out */}
           <div className="header-user-badge">
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', lineHeight: 1.2 }}>
-              <span className="header-user-email" style={{ fontWeight: 'bold' }}>
+            <div className="header-user-info-text">
+              <span className="header-user-email">
                 {user?.name || user?.email?.split('@')[0]}
               </span>
-              <span style={{ fontSize: '0.68rem', color: '#94a3b8' }}>
-                {user?.email} • <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>{user?.role?.toUpperCase()}</span>
+              <span className="header-user-meta">
+                {user?.email} • <span className="header-user-role-highlight">{user?.role?.toUpperCase()}</span>
               </span>
             </div>
             <button
               type="button"
               className="header-signout-btn"
               onClick={logout}
-              title="Sign in with Microsoft Authenticator"
+              title="Sign Out"
             >
-              Switch / Sign Out
+              Sign Out
             </button>
           </div>
         </div>
@@ -156,3 +140,4 @@ export default function Header({ activeTab, onTabChange, operatorView, onOperato
     </header>
   );
 }
+

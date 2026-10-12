@@ -578,16 +578,52 @@
 }
 
 @media (max-width: 860px) {
+  .login-page-root {
+    padding: 1rem;
+    width: 100%;
+    min-height: 100vh;
+  }
   .login-container {
     flex-direction: column;
-    max-width: 480px;
+    max-width: 100%;
+    width: 100%;
+    border-radius: 16px;
   }
   .login-hero-pane {
-    padding: 2rem;
+    padding: 1.75rem 1.5rem;
     border-right: none;
     border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   }
+  .hero-title {
+    font-size: 1.6rem;
+  }
+  .hero-description {
+    font-size: 0.88rem;
+    margin-bottom: 1.25rem;
+  }
   .login-form-pane {
-    padding: 2rem;
+    padding: 1.75rem 1.5rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .login-page-root {
+    padding: 0.5rem;
+  }
+  .login-hero-pane {
+    padding: 1.25rem 1rem;
+  }
+  .hero-title {
+    font-size: 1.35rem;
+  }
+  .login-form-pane {
+    padding: 1.25rem 1rem;
+  }
+  .form-title {
+    font-size: 1.25rem;
+  }
+  .form-input {
+    font-size: 16px; /* Prevents auto zoom */
+    padding: 0.75rem 1rem 0.75rem 2.5rem;
   }
 }

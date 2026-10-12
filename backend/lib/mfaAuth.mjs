@@ -327,17 +327,9 @@ export async function handleCheckEmail(req, res, body = {}) {
     return res.end(JSON.stringify({ success: true, state: 'not_authorised' }));
   }
 
-  let state = 'ask_admin';
-  if (user.mfa_enrolled) {
-    state = 'enter_code';
-  } else if (user.setup_allowed) {
-    state = 'setup';
-  } else {
-    state = 'ask_admin';
-  }
-
+  // MFA removed from active flow: all authorized staff proceed directly to enter_code
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  return res.end(JSON.stringify({ success: true, state }));
+  return res.end(JSON.stringify({ success: true, state: 'enter_code' }));
 }
 
 /**

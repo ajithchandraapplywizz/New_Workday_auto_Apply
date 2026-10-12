@@ -116,3 +116,53 @@ drop trigger if exists applications_updated_at on public.applications;
 create trigger applications_updated_at
 before update on public.applications
 for each row execute function public.set_applications_updated_at();
+
+-- ==============================================================================
+-- Workday application filling LLM token usage
+-- ==============================================================================
+create table if not exists public.workday_application_token_usage (
+  id uuid primary key default gen_random_uuid(),
+  applywizz_id text not null,
+  job_url text not null,
+  role text not null,
+  application_id uuid,
+  model text not null,
+  prompt_tokens integer not null default 0,
+  completion_tokens integer not null default 0,
+  cache_read_tokens integer not null default 0,
+  cache_write_tokens integer not null default 0,
+  total_tokens integer not null default 0,
+  token_cost numeric(12, 6) not null default 0.000000,
+  date date not null default current_date,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint uq_workday_application_token_usage unique (applywizz_id, job_url, date)
+);
+
+create index if not exists idx_workday_token_usage_applywizz
+  on public.workday_application_token_usage (applywizz_id, date desc);
+
+create index if not exists idx_workday_token_usage_date
+  on public.workday_application_token_usage (date desc);
+
+create index if not exists idx_workday_token_usage_application_id
+  on public.workday_application_token_usage (application_id);
+
+create index if not exists idx_workday_token_usage_job_url
+  on public.workday_application_token_usage (job_url);
+
+alter table public.workday_application_token_usage enable row level security;
+
+drop policy if exists "Allow service_role access to workday_application_token_usage" on public.workday_application_token_usage;
+create policy "Allow service_role access to workday_application_token_usage" on public.workday_application_token_usage
+  for all to service_role using (true) with check (true);
+
+drop policy if exists "Allow authenticated read access to workday_application_token_usage" on public.workday_application_token_usage;
+create policy "Allow authenticated read access to workday_application_token_usage" on public.workday_application_token_usage
+  for select to authenticated using (true);
+
+drop policy if exists "Allow anon read access to workday_application_token_usage" on public.workday_application_token_usage;
+create policy "Allow anon read access to workday_application_token_usage" on public.workday_application_token_usage
+  for select to anon using (true);
+

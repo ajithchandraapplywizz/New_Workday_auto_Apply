@@ -16,14 +16,16 @@ import { isGlobalStopRequested } from './browserLifecycle.mjs';
 import { getCleanSupabaseEnv } from './clusterBatchRunner.mjs';
 import { httpsJsonWithRetry } from './httpClient.mjs';
 
-const RESOLVER_WORKER_IDS = ['resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3'];
+import { PIPELINE_CONFIG } from '../config/pipelineConfig.mjs';
+
+export const RESOLVER_WORKER_IDS = PIPELINE_CONFIG.resolveWorkerIds || Array.from({ length: 10 }, (_, i) => `worker_${i + 1}`);
 
 /**
- * Run Stage 2: 3-Worker Resolving Pool
+ * Run Stage 2: 10-Worker Resolving Pool
  */
 export async function runResolvingWorkerPool(options = {}) {
   console.log(`\n${'═'.repeat(72)}`);
-  console.log(`⚡ [STAGE 2: RESOLVER] Launching 3 Resolving Workers for Candidate Answers...`);
+  console.log(`⚡ [STAGE 2: RESOLVER] Launching 10 Resolving Workers for Candidate Answers...`);
   console.log(`   Workers: ${RESOLVER_WORKER_IDS.join(', ')}`);
   console.log(`${'═'.repeat(72)}\n`);
 
@@ -76,7 +78,7 @@ export async function runResolvingWorkerPool(options = {}) {
         state: 'in_flight',
         current_application_id: job.job_url, // STRICT URL IDENTIFICATION
         stage: 'resolving',
-        bot_name: `Resolving Worker ${slotIndex + 1}`,
+        bot_name: `Worker ${slotIndex + 1}`,
       }).catch(() => {});
 
       // STRICT URL IDENTIFICATION: Find candidates specifically assigned to this Job URL in batch_job_queue
@@ -166,6 +168,30 @@ export async function runResolvingWorkerPool(options = {}) {
               }],
             }).catch(() => {});
 
+            // Auto-queue fully answered applications directly into submission_tasks
+            if (isFully) {
+              try {
+                await httpsJsonWithRetry({
+                  url: `${url}/rest/v1/submission_tasks`,
+                  method: 'POST',
+                  headers: {
+                    apikey: key,
+                    Authorization: `Bearer ${key}`,
+                    Prefer: 'resolution=ignore-duplicates',
+                  },
+                  body: {
+                    applywizz_id: awlId,
+                    job_url: job.job_url,
+                    company,
+                    role_title: roleTitle,
+                    status: 'queued',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                  },
+                });
+              } catch {}
+            }
+
             resolvedTotal++;
           }
         } catch (err) {
@@ -178,11 +204,11 @@ export async function runResolvingWorkerPool(options = {}) {
       state: 'idle',
       current_application_id: null,
       stage: 'resolving',
-      bot_name: `Resolving Worker ${slotIndex + 1}`,
+      bot_name: `Worker ${slotIndex + 1}`,
     }).catch(() => {});
   }
 
-  // Run the 3 resolver workers in parallel
+  // Run the 10 resolver workers in parallel
   await Promise.all(RESOLVER_WORKER_IDS.map((wId, i) => resolverLoop(wId, i)));
 
   console.log(`\n✅ [STAGE 2: RESOLVER] Resolution complete. Total distributions pre-resolved: ${resolvedTotal}`);

@@ -101,14 +101,14 @@ export function AuthProvider({ children }) {
       return;
     }
 
-    const allowedRoles = ['ca', 'operator', 'admin', 'manager', 'dev', 'developer'];
+    const allowedRoles = ['admin', 'developer', 'dev'];
     const r = (payload.role || '').toLowerCase();
     if (!allowedRoles.includes(r)) {
-      console.warn('[SECURITY] Denying access to non-staff session:', payload.email);
+      console.warn('[SECURITY] Denying access to non-admin/dev session:', payload.email);
       localStorage.removeItem('applywizz_auth_token');
       localStorage.removeItem('applywizz_auth_session');
       setUser(null);
-      setAuthError('Access denied: Unauthorized email. Only staff accounts are permitted.');
+      setAuthError('Access denied: Only admin and developer accounts are permitted.');
       setIsVerifyingSession(false);
       return;
     }
@@ -182,7 +182,7 @@ export function AuthProvider({ children }) {
       throw new Error('Please enter a valid work email address');
     }
     if (!cleanCode || cleanCode.length !== 6) {
-      throw new Error('Please enter your 6-digit Microsoft Authenticator code');
+      throw new Error('Please enter your 6-digit access code');
     }
 
     const res = await authLogin({ email: cleanEmail, code: cleanCode });
@@ -197,9 +197,8 @@ export function AuthProvider({ children }) {
       id: payload?.sub || payload?.id || res.user?.id,
       email: cleanEmail,
       name: payload?.name || res.user?.name || cleanEmail.split('@')[0],
-      role: payload?.role || res.user?.role || 'ca',
-      manager_id: payload?.manager_id || res.user?.manager_id,
-      baseRole: payload?.role || res.user?.role || 'ca',
+      role: payload?.role || res.user?.role || 'developer',
+      baseRole: payload?.role || res.user?.role || 'developer',
       date,
       timeframe,
     };
@@ -208,13 +207,6 @@ export function AuthProvider({ children }) {
     setUser(sessionUser);
     setAuthError('');
     setIsAuthModalOpen(false);
-
-    // If CA / operator, trigger background work history retrieval
-    if (sessionUser.role === 'ca' || sessionUser.role === 'operator') {
-      try {
-        syncLiveCAData({ caEmail: cleanEmail, dateStr: getYesterdayDateStr() }).catch(() => {});
-      } catch {}
-    }
 
     return sessionUser;
   };

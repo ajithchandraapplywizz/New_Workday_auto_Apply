@@ -993,9 +993,9 @@ export function print10BatchMilestoneReport({
  * 4. Outputs comprehensive 10-batch milestone reports for every 10 batches completed.
  */
 export async function runClusterBatchRunner({
-  topLinks = 3,
-  workers = 3,
-  headless = false, // HEADED execution by default!
+  topLinks = 10,
+  workers = 10,
+  headless = process.env.HEADLESS !== 'false',
   confirmSubmit = false,
   limitPerLink = null,
   defaultPassword = process.env.WORKDAY_PASSWORD || 'Applywizz@2026789',
@@ -1003,10 +1003,10 @@ export async function runClusterBatchRunner({
   const startTime = Date.now();
 
   console.log(`\n${'═'.repeat(78)}`);
-  console.log(`⚡ CLUSTER BATCH RUNNER — 3 PARALLEL WORKERS ON TOP 3 LINKS (HEADED ONLY)`);
+  console.log(`⚡ CLUSTER BATCH RUNNER — 10 PARALLEL SCANNING WORKERS (HEADLESS: ${headless})`);
   console.log(`   Top Links:     ${topLinks} highest client-count clusters`);
-  console.log(`   Workers:       ${workers} parallel workers running simultaneously`);
-  console.log(`   Browser Mode:  HEADED (Visible Browser Windows Only)`);
+  console.log(`   Workers:       ${workers} parallel scanning workers running simultaneously`);
+  console.log(`   Browser Mode:  ${headless ? 'HEADLESS (Production Mode)' : 'HEADED (Visible GUI)'}`);
   console.log(`   Submission:    ${confirmSubmit ? 'Auto-Submit' : 'Halt at Review (Screenshots & Scrapes Only)'}`);
   if (limitPerLink) {
     console.log(`   Link Limit:    Max ${limitPerLink} clients per link (Test Mode)`);
@@ -1014,24 +1014,29 @@ export async function runClusterBatchRunner({
   console.log(`${'═'.repeat(78)}\n`);
 
   // Step 1: Cluster links canonically and select top N
-  console.log(`🔍 Canonicalizing & clustering messy URLs from Supabase batch_job_queue...`);
+  console.log(`🔍 Canonicalizing & clustering URLs from Supabase batch_job_queue...`);
   const topClusters = await fetchQueueClusters({ minClients: 1, limit: topLinks });
 
   if (!topClusters.length) {
     console.log(`❌ No tasks found in batch_job_queue! Setting scanning workers to idle.`);
-    for (let slot = 1; slot <= 3; slot++) {
-      await updateWorkerStatus(`worker-${slot}`, {
+    for (let slot = 1; slot <= 10; slot++) {
+      await updateWorkerStatus(`worker_${slot}`, {
         state: 'idle',
+        stage: 'scanning',
+        bot_name: `Worker ${slot}`,
         current_application_id: 'Ready (0 pending queue items)',
       }).catch(() => { });
     }
     return;
   }
 
-  // Set scanning workers to active in-flight in Supabase worker_status
-  for (let slot = 1; slot <= Math.min(3, topClusters.length); slot++) {
-    await updateWorkerStatus(`worker-${slot}`, {
+  // Set active scanning workers to in-flight in Supabase worker_status
+  const activeCount = Math.min(Number(workers) || 10, topClusters.length);
+  for (let slot = 1; slot <= activeCount; slot++) {
+    await updateWorkerStatus(`worker_${slot}`, {
       state: 'in_flight',
+      stage: 'scanning',
+      bot_name: `Worker ${slot}`,
       current_application_id: 'Clustering & preparing link run...',
     }).catch(() => { });
   }
@@ -1059,10 +1064,10 @@ export async function runClusterBatchRunner({
   const clusterResults = [];
 
   async function workerLoop(slot) {
-    const workerId = `scanning_worker_${slot}`;
+    const workerId = `worker_${slot}`;
     while (clusterIndex < topClusters.length) {
       if (await isClusterStopRequested()) {
-        console.log(`🛑 [Scanning Worker ${slot}] Stop flag active! Halting cluster loop.`);
+        console.log(`🛑 [Worker ${slot}] Stop flag active! Halting cluster loop.`);
         break;
       }
       const myIndex = clusterIndex++;
@@ -1073,10 +1078,10 @@ export async function runClusterBatchRunner({
         state: 'in_flight',
         current_application_id: cluster.jobUrl, // Strictly identify by URL in worker_status
         stage: 'scanning',
-        bot_name: `Scanning Worker ${slot}`,
+        bot_name: `Worker ${slot}`,
       }).catch(() => { });
 
-      console.log(`\n▶️ [Scanning Worker ${slot}] [Batch #${myIndex + 1}/${topClusters.length}] Assigned Job URL: ${cluster.jobUrl}`);
+      console.log(`\n▶️ [Worker ${slot}] [Batch #${myIndex + 1}/${topClusters.length}] Assigned Job URL: ${cluster.jobUrl}`);
       console.log(`   Job Metadata: ${cluster.company} — ${cluster.roleTitle} (${cluster.clientCount} clients)`);
 
       let res = null;
@@ -1126,7 +1131,7 @@ export async function runClusterBatchRunner({
       state: 'idle',
       current_application_id: null,
       stage: 'scanning',
-      bot_name: `Scanning Worker ${slot}`,
+      bot_name: `Worker ${slot}`,
     }).catch(() => { });
   }
 
@@ -1154,12 +1159,12 @@ export async function runClusterBatchRunner({
   }
 
   // Return all scanning workers to idle
-  for (let slot = 1; slot <= 3; slot++) {
-    await updateWorkerStatus(`scanning_worker_${slot}`, {
+  for (let slot = 1; slot <= 10; slot++) {
+    await updateWorkerStatus(`worker_${slot}`, {
       state: 'idle',
       current_application_id: null,
       stage: 'scanning',
-      bot_name: `Scanning Worker ${slot}`,
+      bot_name: `Worker ${slot}`,
     }).catch(() => { });
   }
 

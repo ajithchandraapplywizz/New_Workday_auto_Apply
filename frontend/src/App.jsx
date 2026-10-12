@@ -1,20 +1,16 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import Header from './components/Header';
 import MicrosoftAuthModal from './components/MicrosoftAuthModal';
 import DeveloperDashboard from './pages/DeveloperDashboard';
 import AdminDashboard from './pages/AdminDashboard';
-import ManagerDashboard from './pages/ManagerDashboard';
-import OperatorDashboard from './pages/OperatorDashboard';
-import CADashboard from './pages/CADashboard';
 import LoginPage from './pages/LoginPage';
 import './App.css';
 
 function MainLayout() {
   const { user, isAuthModalOpen, setIsAuthModalOpen, isVerifyingSession, authError } = useAuth();
-  const [operatorView, setOperatorView] = useState('dashboard'); // 'dashboard' | 'stats' | 'review'
 
-  const allowedRoles = ['ca', 'operator', 'admin', 'manager', 'dev', 'developer'];
+  const allowedRoles = ['admin', 'dev', 'developer'];
   const isStaff = user && allowedRoles.includes(user.role?.toLowerCase());
 
   // Show verifying state while session is being verified to prevent any flash of dashboard
@@ -31,13 +27,12 @@ function MainLayout() {
     return <LoginPage accessDenied={Boolean(user && !isStaff) || Boolean(authError)} />;
   }
 
+  const isDev = user?.role === 'dev' || user?.role === 'developer';
+
   return (
     <div className="video-app-wrapper">
-      {/* Top Header matching video */}
-      <Header
-        operatorView={operatorView}
-        onOperatorViewChange={setOperatorView}
-      />
+      {/* Top Header */}
+      <Header />
 
       {/* Microsoft Authenticator Sign In / Sign Up Modal */}
       <MicrosoftAuthModal
@@ -47,16 +42,7 @@ function MainLayout() {
 
       {/* Main Role-Specific View */}
       <main className="video-main-content">
-        {user?.role === 'dev' && <DeveloperDashboard />}
-        {user?.role === 'admin' && <AdminDashboard />}
-        {user?.role === 'manager' && <ManagerDashboard />}
-        {(user?.role === 'ca' || user?.role === 'operator') && (
-          operatorView === 'review' ? (
-            <CADashboard />
-          ) : (
-            <OperatorDashboard operatorView={operatorView} />
-          )
-        )}
+        {isDev ? <DeveloperDashboard /> : <AdminDashboard />}
       </main>
     </div>
   );
@@ -69,3 +55,4 @@ export default function App() {
     </AuthProvider>
   );
 }
+

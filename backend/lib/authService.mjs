@@ -101,9 +101,6 @@ export function extractBearerToken(req) {
  */
 export function authenticateStaffRole(req, res, allowedRoles = ['admin', 'developer', 'dev']) {
   const token = extractBearerToken(req);
-  const host = req.headers['host'] || '';
-  const origin = req.headers['origin'] || '';
-  const isLocalDashboard = host.includes('localhost') || host.includes('127.0.0.1') || origin.includes('localhost') || origin.includes('5180') || host.includes('5180');
 
   const corsHeaders = {
     'Content-Type': 'application/json',
@@ -113,9 +110,6 @@ export function authenticateStaffRole(req, res, allowedRoles = ['admin', 'develo
   };
 
   if (!token) {
-    if (isLocalDashboard && process.env.NODE_ENV !== 'production') {
-      return { role: 'admin', email: 'admin@applywizz.ai', name: 'Admin User' };
-    }
     res.writeHead(401, corsHeaders);
     res.end(JSON.stringify({ success: false, error: 'Unauthorized: Bearer token required' }));
     return null;
@@ -123,9 +117,6 @@ export function authenticateStaffRole(req, res, allowedRoles = ['admin', 'develo
 
   const decoded = verifyJwt(token);
   if (!decoded || !decoded.email) {
-    if (isLocalDashboard && process.env.NODE_ENV !== 'production') {
-      return { role: 'admin', email: 'admin@applywizz.ai', name: 'Admin User' };
-    }
     res.writeHead(401, corsHeaders);
     res.end(JSON.stringify({ success: false, error: 'Unauthorized: Invalid or expired token' }));
     return null;
@@ -190,6 +181,202 @@ export function computePresence(lastSeenAt) {
   };
 }
 
+// Rate limiting specifically for login attempts (sliding window 60s, max 5 attempts)
+const loginIpRateLimits = new Map();
+const loginEmailRateLimits = new Map();
+const LOGIN_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5;
+
+function checkLoginRateLimit(map, key) {
+  if (!key) return true;
+  const now = Date.now();
+  const entry = map.get(key) || { count: 0, resetAt: now + LOGIN_RATE_LIMIT_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + LOGIN_RATE_LIMIT_WINDOW_MS;
+  }
+  entry.count++;
+  map.set(key, entry);
+  return entry.count <= LOGIN_RATE_LIMIT_MAX_ATTEMPTS;
+}
+
+/**
+ * Backend Default Code Login Handler
+ * Checks email, role (admin or developer), and default code against DEFAULT_LOGIN_CODE env var.
+ * Rate-limits login attempts (max 5 per minute per IP / email).
+ * Issues signed short-lived JWT token.
+ */
+export async function handleDefaultCodeLogin(req, res, body = {}) {
+  const corsHeaders = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  };
+
+  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'ip';
+  const email = String(body.email || '').trim().toLowerCase();
+  const code = String(body.code || body.password || '').trim();
+  const requestedRole = String(body.role || '').toLowerCase().trim();
+
+  // 1. Rate Limiting Check
+  if (!checkLoginRateLimit(loginIpRateLimits, ip) || (email && !checkLoginRateLimit(loginEmailRateLimits, email))) {
+    res.writeHead(429, corsHeaders);
+    return res.end(JSON.stringify({
+      success: false,
+      error: 'Too many login attempts. Please wait 1 minute before trying again.',
+    }));
+  }
+
+  // 2. Default Login Code Check from env var
+  const defaultLoginCode = String(process.env.DEFAULT_LOGIN_CODE || '000000').trim();
+  if (!code || code !== defaultLoginCode) {
+    res.writeHead(401, corsHeaders);
+    return res.end(JSON.stringify({
+      success: false,
+      error: 'Invalid login code',
+    }));
+  }
+
+  // 3. Email Validation
+  if (!email || !email.includes('@')) {
+    res.writeHead(400, corsHeaders);
+    return res.end(JSON.stringify({ success: false, error: 'Valid work email required' }));
+  }
+
+  // 4. Reject candidate/client accounts
+  try {
+    const { data: client } = await supabase
+      .from('clients')
+      .select('id, company_email, personal_email')
+      .or(`company_email.ilike.${email},personal_email.ilike.${email}`)
+      .limit(1)
+      .maybeSingle();
+
+    if (client) {
+      res.writeHead(403, corsHeaders);
+      return res.end(JSON.stringify({
+        success: false,
+        error: 'Forbidden: Candidate emails cannot access this portal',
+      }));
+    }
+  } catch {}
+
+  // 5. Look up in auth_users
+  let { data: authUser } = await supabase
+    .from('auth_users')
+    .select('*')
+    .ilike('email', email)
+    .maybeSingle();
+
+  // Auto-provision if official staff email domain
+  if (!authUser) {
+    const isStaff = (
+      email.endsWith('@applywizz.ai') ||
+      email.endsWith('@applywizz.com') ||
+      email.endsWith('@applywizard.ai') ||
+      email.endsWith('@apply-wizz.me')
+    );
+
+    if (!isStaff) {
+      res.writeHead(403, corsHeaders);
+      return res.end(JSON.stringify({
+        success: false,
+        error: 'Forbidden: Only authorized staff accounts are permitted',
+      }));
+    }
+
+    let assignedRole = 'developer';
+    if (requestedRole === 'admin' || email.includes('admin')) {
+      assignedRole = 'admin';
+    } else if (requestedRole === 'developer' || requestedRole === 'dev' || email.includes('dev')) {
+      assignedRole = 'developer';
+    }
+
+    const nowIso = new Date().toISOString();
+    const name = email.split('@')[0].replace(/[._-]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+
+    const { data: createdUser, error: insErr } = await supabase
+      .from('auth_users')
+      .insert({
+        email,
+        name,
+        role: assignedRole,
+        status: 'active',
+        last_sign_in: nowIso,
+        last_seen_at: nowIso,
+        created_at: nowIso,
+        updated_at: nowIso,
+      })
+      .select('*')
+      .maybeSingle();
+
+    if (insErr) {
+      console.warn('[AUTH] Error inserting staff into auth_users:', insErr.message);
+    }
+    authUser = createdUser || { email, name, role: assignedRole, status: 'active' };
+  }
+
+  const status = String(authUser.status || '').toLowerCase().trim();
+  if (status !== 'active') {
+    res.writeHead(403, corsHeaders);
+    return res.end(JSON.stringify({
+      success: false,
+      error: 'Forbidden: Account is inactive. Please contact an administrator.',
+    }));
+  }
+
+  let role = String(authUser.role || '').toLowerCase().trim();
+  if (role === 'dev') role = 'developer';
+
+  // Role validation: Only admin and developer are permitted
+  if (role !== 'admin' && role !== 'developer') {
+    res.writeHead(403, corsHeaders);
+    return res.end(JSON.stringify({
+      success: false,
+      error: `Forbidden: Only 'admin' and 'developer' roles are permitted (account has role '${authUser.role}')`,
+    }));
+  }
+
+  // If user requested a specific allowed role
+  if (requestedRole && (requestedRole === 'admin' || requestedRole === 'developer' || requestedRole === 'dev')) {
+    if (requestedRole === 'admin' && role !== 'admin') {
+      res.writeHead(403, corsHeaders);
+      return res.end(JSON.stringify({
+        success: false,
+        error: 'Forbidden: Developer accounts cannot access Admin role',
+      }));
+    }
+    if (role === 'admin' && (requestedRole === 'developer' || requestedRole === 'dev')) {
+      role = 'developer';
+    }
+  }
+
+  // 6. Success: Update last_seen_at and return signed short-lived JWT (12 hours)
+  const nowIso = new Date().toISOString();
+  await updateLastSeenAt(email, nowIso);
+
+  const token = signJwt({
+    id: authUser.id,
+    sub: authUser.id,
+    email,
+    name: authUser.name || email.split('@')[0],
+    role, // 'admin' or 'developer'
+  }, 12 * 3600);
+
+  res.writeHead(200, corsHeaders);
+  return res.end(JSON.stringify({
+    success: true,
+    token,
+    user: {
+      id: authUser.id,
+      email,
+      name: authUser.name || email.split('@')[0],
+      role,
+      last_seen_at: nowIso,
+    },
+  }));
+}
+
 /**
  * Handles all /api/auth/* requests
  */
@@ -221,79 +408,7 @@ export async function handleAuthRequest(req, res, pathname, body = {}) {
 
   // ── POST /api/auth/login ──
   if (pathname === '/api/auth/login' && req.method === 'POST') {
-    // Route to secure TOTP Microsoft Authenticator logic if code provided or MFA login requested
-    if (body.code !== undefined) {
-      return handleMfaLogin(req, res, body);
-    }
-    const email = String(body.email || '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false, error: 'Valid email required' }));
-    }
-
-    const nowIso = new Date().toISOString();
-
-    // 1. Fetch user from auth_users
-    let { data: authUser } = await supabase
-      .from('auth_users')
-      .select('*')
-      .ilike('email', email)
-      .maybeSingle();
-
-    // If user not in auth_users yet, find from operators or create staff row
-    if (!authUser) {
-      const { data: op } = await supabase
-        .from('operators')
-        .select('*')
-        .ilike('email', email)
-        .maybeSingle();
-
-      const role = op?.role || (email.includes('admin') ? 'admin' : (email.includes('manager') ? 'manager' : 'ca'));
-      const name = op?.name || email.split('@')[0];
-
-      const { data: newAU } = await supabase
-        .from('auth_users')
-        .insert({
-          email,
-          name,
-          role,
-          manager_id: op?.manager_id || null,
-          status: 'active', // Allowed to sign in flag
-          last_sign_in: nowIso,
-          created_at: nowIso,
-          updated_at: nowIso,
-        })
-        .select('*')
-        .maybeSingle();
-
-      authUser = newAU || { email, name, role };
-    }
-
-    // Set last_seen_at = now() (do NOT change auth_users.status)
-    await updateLastSeenAt(email, nowIso);
-    lastHeartbeatWriteMap.set(email, Date.now());
-
-    const token = signJwt({
-      id: authUser?.id,
-      email,
-      name: authUser?.name,
-      role: authUser?.role,
-      manager_id: authUser?.manager_id,
-    });
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      success: true,
-      token,
-      user: {
-        id: authUser?.id,
-        email,
-        name: authUser?.name,
-        role: authUser?.role,
-        manager_id: authUser?.manager_id,
-        last_seen_at: nowIso,
-      },
-    }));
+    return handleDefaultCodeLogin(req, res, body);
   }
 
   // ── POST /api/auth/setup/confirm ──

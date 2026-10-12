@@ -7,22 +7,17 @@
  * - Isolated Context: each task runs in its own fresh Playwright browser context
  */
 
-import { loadLocalEnvOnce } from './supabaseClient.mjs';
+import { loadLocalEnvOnce, updateWorkerStatus, getWorkerControls } from './supabaseClient.mjs';
 import { createClient } from '@supabase/supabase-js';
-import { updateWorkerStatus } from './supabaseClient.mjs';
-import { getWorkerContext } from './browserLifecycle.mjs';
+import { getWorkerContext, isGlobalStopRequested } from './browserLifecycle.mjs';
+
+import { PIPELINE_CONFIG } from '../config/pipelineConfig.mjs';
 
 loadLocalEnvOnce();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-export const SUBMISSION_WORKER_IDS = [
-  'submitting_worker_1',
-  'submitting_worker_2',
-  'submitting_worker_3',
-  'submitting_worker_4',
-  'submitting_worker_5',
-  'submitting_worker_6',
-];
+export const SUBMISSION_WORKER_IDS = PIPELINE_CONFIG.submitWorkerIds || Array.from({ length: 10 }, (_, i) => `worker_${i + 1}`);
+
 
 /**
  * B1 Helper: Updates submission_tasks, checks { data, error },
@@ -127,6 +122,9 @@ export async function updateJobDistributionWithCheck({
  */
 export async function claimNextTask(workerId) {
   if (!workerId) return null;
+  if (isGlobalStopRequested()) return null;
+  const controls = await getWorkerControls().catch(() => null);
+  if (controls?.submit?.stop_requested) return null;
   const now = new Date().toISOString();
 
   // 1. Try PostgreSQL RPC (guarantees DB-level FOR UPDATE SKIP LOCKED)
@@ -139,14 +137,14 @@ export async function claimNextTask(workerId) {
     }
   } catch { }
 
-  // 2. Direct atomic fallback (CAS: Compare-And-Swap on oldest queued row)
+  // 2. Direct atomic fallback (CAS: Compare-And-Swap on oldest ready_for_review / queued row)
   try {
     const { data: candidates } = await supabase
       .from('submission_tasks')
-      .select('id')
-      .eq('status', 'queued')
+      .select('id, status')
+      .in('status', ['ready_for_review', 'queued'])
       .order('created_at', { ascending: true })
-      .limit(5);
+      .limit(10);
 
     if (!candidates || candidates.length === 0) return null;
 
@@ -161,7 +159,7 @@ export async function claimNextTask(workerId) {
           updated_at: now,
         })
         .eq('id', cand.id)
-        .eq('status', 'queued')
+        .eq('status', cand.status)
         .select('*');
 
       if (!claimErr && claimed && claimed.length > 0) {
@@ -268,11 +266,12 @@ export async function processClaimedTask({ task, workerId, headless = true, runn
   console.log(`\n🚀 [${workerId}] Processing task #${task.id} (${task.applywizz_id} @ ${task.company || 'Company'})...`);
 
   // Update worker_status table
+  const workerNum = String(workerId).replace('worker_', '');
   await updateWorkerStatus(workerId, {
     state: 'in_flight',
     stage: 'submitting',
     current_application_id: task.id,
-    bot_name: `Submitting Worker ${workerId.slice(-1)}`,
+    bot_name: `Worker ${workerNum}`,
     updated_at: new Date().toISOString(),
   }).catch(() => { });
 
@@ -504,11 +503,12 @@ export async function processClaimedTask({ task, workerId, headless = true, runn
     stopHeartbeat();
     if (watchdogTimer) clearTimeout(watchdogTimer);
     // Release worker back to idle
+    const workerNum = String(workerId).replace('worker_', '');
     await updateWorkerStatus(workerId, {
       state: 'idle',
       stage: 'submitting',
       current_application_id: null,
-      bot_name: `Submitting Worker ${workerId.slice(-1)}`,
+      bot_name: `Worker ${workerNum}`,
       updated_at: new Date().toISOString(),
     }).catch(() => { });
   }

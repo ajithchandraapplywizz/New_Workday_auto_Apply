@@ -80,12 +80,12 @@ export default function LoginPage({ accessDenied }) {
     }
   };
 
-  // ── Step 2A: Enter 6-digit Code for Enrolled User ──
+  // ── Step 2A: Enter 6-digit Access Code ──
   const handleLoginSubmit = async (e) => {
     if (e) e.preventDefault();
     const cleanCode = String(code || '').trim();
     if (!cleanCode || cleanCode.length !== 6) {
-      setError('Please enter your 6-digit Microsoft Authenticator code');
+      setError('Please enter your 6-digit access code');
       return;
     }
 
@@ -99,12 +99,12 @@ export default function LoginPage({ accessDenied }) {
       });
     } catch (err) {
       const msg = err.data?.error || err.message || '';
-      if (err.status === 423 || msg.toLowerCase().includes('locked')) {
-        setError(msg || 'Account is temporarily locked due to repeated failed attempts. Please wait 15 minutes.');
-      } else if (msg.toLowerCase().includes('already been used') || err.status === 400) {
-        setError('This code has already been used. Please wait for the next 30-second code on your authenticator.');
-      } else if (err.status === 401) {
-        setError('Invalid authentication code. Please check your Microsoft Authenticator and try again.');
+      if (err.status === 429 || msg.toLowerCase().includes('too many')) {
+        setError('Too many login attempts. Please wait 1 minute before trying again.');
+      } else if (err.status === 401 || msg.toLowerCase().includes('invalid')) {
+        setError('Invalid access code. Please check your code and try again.');
+      } else if (err.status === 403 || msg.toLowerCase().includes('forbidden')) {
+        setError(msg || 'Access denied: Only admin and developer accounts are permitted.');
       } else if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
         setError('Network error: Authentication server is unreachable.');
       } else {

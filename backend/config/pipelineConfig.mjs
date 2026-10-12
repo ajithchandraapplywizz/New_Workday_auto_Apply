@@ -1,14 +1,17 @@
 /**
- * pipelineConfig.mjs — 9-Worker Autonomous Pipeline Configuration
+ * pipelineConfig.mjs — 10-Worker Shared Pipeline Configuration
  *
- * Configures strictly 9 canonical workers across 3 dedicated pipeline stages:
- * - Stage 1 (Scanning): 3 parallel workers ('scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3')
- * - Stage 2 (Resolving): 3 parallel workers ('resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3')
- * - Human Review Pause: Career Associates review answers in Dashboard
- * - Stage 3 (Submissions): 3 parallel workers ('submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3')
+ * Configures strictly 10 shared canonical workers (worker_1 through worker_10):
+ * - Scanning & Resolving: The 10 workers scan unique job links and resolve 4-tier answers in parallel.
+ * - Submissions: The same 10 workers execute Workday submissions in parallel on Railway.
  *
- * Database worker_status table maintains strictly these 9 rows.
+ * Database worker_status table maintains strictly these 10 rows.
  */
+
+const WORKER_IDS = Array.from({ length: 10 }, (_, i) => `worker_${i + 1}`);
+
+const WORKER_NAMES = {};
+WORKER_IDS.forEach((id, i) => { WORKER_NAMES[id] = `Worker ${i + 1}`; });
 
 export const PIPELINE_CONFIG = {
   stages: {
@@ -19,41 +22,17 @@ export const PIPELINE_CONFIG = {
     IDLE: 'idle',
   },
 
-  workersCount: 12,
+  workersCount: 10,
 
-  scanWorkerIds: ['scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3'],
-  resolveWorkerIds: ['resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3'],
-  submitWorkerIds: [
-    'submitting_worker_1',
-    'submitting_worker_2',
-    'submitting_worker_3',
-    'submitting_worker_4',
-    'submitting_worker_5',
-    'submitting_worker_6',
-  ],
+  scanWorkerIds: WORKER_IDS,
+  resolveWorkerIds: WORKER_IDS,
+  submitWorkerIds: WORKER_IDS,
 
-  workerNames: {
-    scanning_worker_1: 'Scanning Worker 1',
-    scanning_worker_2: 'Scanning Worker 2',
-    scanning_worker_3: 'Scanning Worker 3',
-    resolving_worker_1: 'Resolving Worker 1',
-    resolving_worker_2: 'Resolving Worker 2',
-    resolving_worker_3: 'Resolving Worker 3',
-    submitting_worker_1: 'Submitting Worker 1',
-    submitting_worker_2: 'Submitting Worker 2',
-    submitting_worker_3: 'Submitting Worker 3',
-    submitting_worker_4: 'Submitting Worker 4',
-    submitting_worker_5: 'Submitting Worker 5',
-    submitting_worker_6: 'Submitting Worker 6',
-  },
+  workerNames: WORKER_NAMES,
+  allWorkerIds: WORKER_IDS,
 
-  allWorkerIds: [
-    'scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3',
-    'resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3',
-    'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
-    'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
-  ],
-
-  webhookPort: Number(process.env.DAEMON_PORT) || 3001,
+  webhookPort: Number(process.env.PORT) || Number(process.env.DAEMON_PORT) || 8080,
   headless: process.env.HEADLESS !== 'false',
 };
+
+

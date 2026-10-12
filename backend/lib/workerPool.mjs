@@ -72,7 +72,7 @@ export async function isWorkerPoolStopRequested() {
  */
 export async function executeWorkerTask({
   task,
-  workerId = 'submitting_worker_1',
+  workerId = 'worker_1',
   taskIndex = 1,
   totalTasks = 1,
   options = {},
@@ -1576,7 +1576,7 @@ export async function runQueueWorkerPool({
 
   // ── 7. Worker Loop ──────────────────────────────────────────────────
   async function queueWorkerLoop(workerNumber) {
-    const workerId = `submitting_worker_${workerNumber}`;
+    const workerId = `worker_${workerNumber}`;
 
     while (taskPointer < taskLimit) {
       if (await isWorkerPoolStopRequested()) {
@@ -1585,7 +1585,7 @@ export async function runQueueWorkerPool({
           state: 'idle',
           current_application_id: null,
           stage: 'submitting',
-          bot_name: `Submitting Worker ${workerNumber}`,
+          bot_name: `Worker ${workerNumber}`,
         }).catch(() => {});
         break;
       }
@@ -1697,11 +1697,11 @@ export async function runQueueWorkerPool({
   await Promise.all(workerPromises);
 
   for (let w = 1; w <= concurrency; w++) {
-    await updateWorkerStatus(`submitting_worker_${w}`, {
+    await updateWorkerStatus(`worker_${w}`, {
       state: 'idle',
       current_application_id: null,
       stage: 'submitting',
-      bot_name: `Submitting Worker ${w}`,
+      bot_name: `Worker ${w}`,
     }).catch(() => {});
   }
 
@@ -1746,7 +1746,7 @@ export async function executeSingleTargetedSubmission({
   distributionId = null,
   applywizzId = '',
   jobUrl = '',
-  workerId = 'submitting_worker_1',
+  workerId = 'worker_1',
   headless = true,
   defaultPassword = process.env.WORKDAY_PASSWORD || 'Applywizz@2026789',
 } = {}) {

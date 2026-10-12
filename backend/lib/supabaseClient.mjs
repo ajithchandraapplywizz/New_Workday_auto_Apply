@@ -1271,89 +1271,52 @@ export async function autoRecordVerifiedFieldAnswer(profile = {}, field = {}, an
 
 /**
  * Update worker state in Supabase worker_status table.
- * State can be 'idle', 'in_flight', 'applying'.
+ * Strictly 10 shared canonical workers (worker_1 through worker_10).
  */
-export const CANONICAL_9_WORKERS = new Set([
-  'scanning_worker_1', 'scanning_worker_2', 'scanning_worker_3',
-  'resolving_worker_1', 'resolving_worker_2', 'resolving_worker_3',
-  'submitting_worker_1', 'submitting_worker_2', 'submitting_worker_3',
-  'submitting_worker_4', 'submitting_worker_5', 'submitting_worker_6',
-]);
+const CANONICAL_IDS = Array.from({ length: 10 }, (_, i) => `worker_${i + 1}`);
 
-const WORKER_STAGE_MAP = {
-  scanning_worker_1: { stage: 'scanning', botName: 'Scanning Worker 1' },
-  scanning_worker_2: { stage: 'scanning', botName: 'Scanning Worker 2' },
-  scanning_worker_3: { stage: 'scanning', botName: 'Scanning Worker 3' },
-  resolving_worker_1: { stage: 'resolving', botName: 'Resolving Worker 1' },
-  resolving_worker_2: { stage: 'resolving', botName: 'Resolving Worker 2' },
-  resolving_worker_3: { stage: 'resolving', botName: 'Resolving Worker 3' },
-  submitting_worker_1: { stage: 'submitting', botName: 'Submitting Worker 1' },
-  submitting_worker_2: { stage: 'submitting', botName: 'Submitting Worker 2' },
-  submitting_worker_3: { stage: 'submitting', botName: 'Submitting Worker 3' },
-  submitting_worker_4: { stage: 'submitting', botName: 'Submitting Worker 4' },
-  submitting_worker_5: { stage: 'submitting', botName: 'Submitting Worker 5' },
-  submitting_worker_6: { stage: 'submitting', botName: 'Submitting Worker 6' },
-};
+export const CANONICAL_10_WORKERS = new Set(CANONICAL_IDS);
+export const CANONICAL_9_WORKERS = CANONICAL_10_WORKERS; // Backward compatibility alias
+
+const WORKER_STAGE_MAP = {};
+CANONICAL_IDS.forEach((id, i) => {
+  WORKER_STAGE_MAP[id] = { stage: 'idle', botName: `Worker ${i + 1}` };
+});
 
 /**
- * Normalizes any worker ID alias to one of the canonical database worker IDs.
+ * Normalizes any worker ID alias to one of the canonical database worker IDs (worker_1 .. worker_10).
  */
 export function normalizeCanonicalWorkerId(workerId, defaultStage = null) {
   if (!workerId) return null;
   let cleanId = String(workerId).trim().toLowerCase();
 
-  if (CANONICAL_9_WORKERS.has(cleanId)) return cleanId;
+  if (CANONICAL_10_WORKERS.has(cleanId)) return cleanId;
 
-  // Handle explicit stage aliases
-  if (cleanId.includes('scan')) {
-    if (cleanId.endsWith('1')) return 'scanning_worker_1';
-    if (cleanId.endsWith('2')) return 'scanning_worker_2';
-    if (cleanId.endsWith('3')) return 'scanning_worker_3';
-    return 'scanning_worker_1';
-  }
-  if (cleanId.includes('resolve')) {
-    if (cleanId.endsWith('1')) return 'resolving_worker_1';
-    if (cleanId.endsWith('2')) return 'resolving_worker_2';
-    if (cleanId.endsWith('3')) return 'resolving_worker_3';
-    return 'resolving_worker_1';
-  }
-  if (cleanId.includes('submit')) {
-    if (cleanId.endsWith('1')) return 'submitting_worker_1';
-    if (cleanId.endsWith('2')) return 'submitting_worker_2';
-    if (cleanId.endsWith('3')) return 'submitting_worker_3';
-    if (cleanId.endsWith('4')) return 'submitting_worker_4';
-    if (cleanId.endsWith('5')) return 'submitting_worker_5';
-    if (cleanId.endsWith('6')) return 'submitting_worker_6';
-    return 'submitting_worker_1';
-  }
-
-  // Handle generic worker-1..3 using defaultStage context
-  const numMatch = cleanId.match(/[123]/);
-  const num = numMatch ? numMatch[0] : '1';
-  if (defaultStage === 'resolving') return `resolving_worker_${num}`;
-  if (defaultStage === 'submitting') return `submitting_worker_${num}`;
-  return `scanning_worker_${num}`;
+  const numMatch = cleanId.match(/\d+/);
+  const num = numMatch ? Math.min(Math.max(parseInt(numMatch[0], 10), 1), 10) : 1;
+  return `worker_${num}`;
 }
 
 /**
- * Update worker state in Supabase worker_status table across the 9 canonical rows.
+ * Update worker state in Supabase worker_status table across the 10 canonical rows.
  */
 export async function updateWorkerStatus(workerId, { state = 'idle', current_application_id = null, stage = null, bot_name = null } = {}) {
   if (!isSupabaseConfigured() || !workerId) return false;
   try {
     const cleanId = normalizeCanonicalWorkerId(workerId, stage);
-    if (!cleanId || !CANONICAL_9_WORKERS.has(cleanId)) {
+    if (!cleanId || !CANONICAL_10_WORKERS.has(cleanId)) {
       return false;
     }
 
-    const validState = (state === 'in_flight' || state === 'busy' || state === 'running') ? 'in_flight' : 'idle';
+    const validState = (state === 'in_flight' || state === 'busy' || state === 'running' || state === 'applying') ? 'in_flight' : 'idle';
+    const num = cleanId.replace('worker_', '');
     const meta = WORKER_STAGE_MAP[cleanId] || {};
 
     const body = {
       state: validState,
       current_application_id: current_application_id || null,
       stage: stage || meta.stage || 'idle',
-      bot_name: bot_name || meta.botName || cleanId,
+      bot_name: bot_name || meta.botName || `Worker ${num}`,
       updated_at: new Date().toISOString(),
     };
 
@@ -1385,7 +1348,7 @@ export async function updateWorkerStatus(workerId, { state = 'idle', current_app
 }
 
 /**
- * Fetch all 9 worker rows from worker_status table.
+ * Fetch all 10 worker rows from worker_status table.
  */
 export async function getWorkerStatuses() {
   if (!isSupabaseConfigured()) return [];
@@ -1414,7 +1377,7 @@ export async function getWorkerStatuses() {
 }
 
 /**
- * Ensures strictly the 9 canonical worker rows exist in worker_status.
+ * Ensures strictly the 10 canonical worker rows exist in worker_status.
  * Prunes any obsolete/polluting rows.
  */
 export async function ensureCanonicalWorkers() {
@@ -1424,7 +1387,7 @@ export async function ensureCanonicalWorkers() {
     const currentIds = new Set(current.map(r => r.worker_id));
     const now = new Date().toISOString();
 
-    for (const id of CANONICAL_9_WORKERS) {
+    for (const id of CANONICAL_10_WORKERS) {
       if (!currentIds.has(id)) {
         const meta = WORKER_STAGE_MAP[id] || {};
         try {
@@ -1457,7 +1420,7 @@ export async function ensureCanonicalWorkers() {
 
     // Delete any non-canonical rows
     for (const r of current) {
-      if (!CANONICAL_9_WORKERS.has(r.worker_id)) {
+      if (!CANONICAL_10_WORKERS.has(r.worker_id)) {
         await request('worker_status', {
           method: 'DELETE',
           query: `?worker_id=eq.${encodeURIComponent(r.worker_id)}`,
@@ -1503,6 +1466,63 @@ export async function updateBotControl(patch = {}) {
   } catch {
     return false;
   }
+}
+
+const memoryWorkerControls = {
+  scan: { key: 'scan', enabled: false, stop_requested: false, updated_by: 'system', updated_at: new Date().toISOString() },
+  submit: { key: 'submit', enabled: false, stop_requested: false, updated_by: 'system', updated_at: new Date().toISOString() },
+};
+
+/**
+ * Fetch all worker controls (scan and submit) from worker_controls table.
+ */
+export async function getWorkerControls() {
+  if (isSupabaseConfigured()) {
+    try {
+      const rows = await request('worker_controls', {
+        method: 'GET',
+        query: '?select=*',
+      });
+      if (Array.isArray(rows) && rows.length > 0) {
+        for (const r of rows) {
+          if (r.key) memoryWorkerControls[r.key] = { ...memoryWorkerControls[r.key], ...r };
+        }
+      }
+    } catch {
+      // Table worker_controls not in Supabase yet, fallback smoothly to memoryWorkerControls
+    }
+  }
+  return { ...memoryWorkerControls };
+}
+
+/**
+ * Update worker control row for key ('scan' | 'submit')
+ */
+export async function updateWorkerControl(key, patch = {}) {
+  if (!key) return false;
+  const now = new Date().toISOString();
+  memoryWorkerControls[key] = {
+    ...memoryWorkerControls[key],
+    ...patch,
+    updated_at: now,
+  };
+  if (isSupabaseConfigured()) {
+    try {
+      const body = {
+        ...patch,
+        updated_at: now,
+      };
+      await request('worker_controls', {
+        method: 'PATCH',
+        query: `?key=eq.${encodeURIComponent(key)}`,
+        prefer: 'return=minimal',
+        body,
+      });
+    } catch {
+      // In case table not yet created in Supabase SQL editor
+    }
+  }
+  return true;
 }
 
 /**

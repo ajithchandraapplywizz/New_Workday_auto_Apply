@@ -287,3 +287,27 @@
 .animate-fade-in {
   animation: fadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
+
+@media (max-width: 600px) {
+  .ms-auth-overlay {
+    padding: 0.75rem;
+  }
+  .ms-auth-container {
+    max-width: 100%;
+    width: 100%;
+  }
+  .ms-auth-card {
+    padding: 1.25rem 1rem;
+    border-radius: 14px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .ms-brand-title {
+    font-size: 1.3rem;
+  }
+  .ms-preset-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+}
+

@@ -45,6 +45,7 @@ import { isApiOnlyAnswerMode } from './apiOnlyProfile.mjs';
 import { isSupabaseConfigured, upsertSupabaseAnswer } from './supabaseClient.mjs';
 import { buildLlmDateContext, getTodayISODate } from './date-utils.mjs';
 import { isValidCityName, isValidStateName } from './clientContact.mjs';
+import { recordApplicationTokenUsage } from './tokenUsage.mjs';
 
 /**
  * True for free-text / numeric input controls (not dropdown/radio with options).
@@ -93,7 +94,7 @@ export function isOpenRouterEnabled() {
  * with automatic fallback to high-efficiency alternative models on rate-limit or errors.
  * Always returns a response shaped like OpenAI: { choices:[{ message:{ content } }] }
  */
-export async function openRouterChat({ messages, temperature = 0.1, max_tokens = 400, timeoutMs = 45000 } = {}) {
+export async function openRouterChat({ messages, temperature = 0.1, max_tokens = 400, timeoutMs = 45000, applicationContext = null } = {}) {
   const key = getApiKey();
   if (!key) throw new Error('No LLM API key configured (set OPENROUTER_API_KEY in .env)');
 
@@ -131,7 +132,22 @@ export async function openRouterChat({ messages, temperature = 0.1, max_tokens =
         throw lastError;
       }
 
-      return res.json();
+      const data = res.json();
+      if (applicationContext && applicationContext.applywizz_id && applicationContext.job_url && data?.usage) {
+        recordApplicationTokenUsage({
+          applywizz_id: applicationContext.applywizz_id,
+          job_url: applicationContext.job_url,
+          role: applicationContext.role || 'Candidate',
+          application_id: applicationContext.application_id || null,
+          model: data.model || model,
+          prompt_tokens: data.usage.prompt_tokens || 0,
+          completion_tokens: data.usage.completion_tokens || 0,
+          cache_read_tokens: data.usage.prompt_tokens_details?.cached_tokens || 0,
+          metadata: applicationContext.metadata || {},
+        }).catch((err) => console.error('[TokenUsage Error]', err.message));
+      }
+
+      return data;
     } catch (err) {
       lastError = err;
       if (/429|502|503|quota|rate limit|not found/i.test(err.message)) {
